@@ -15,7 +15,12 @@ export interface Calendar {
 // Fields sent when a calendar is created or changed.
 export type CalendarPatch = Partial<Omit<Calendar, 'id' | 'primary'>>;
 
+// How often an event repeats.
+export type Repeat = '' | 'daily' | 'weekly' | 'monthly' | 'yearly';
+
 // An event as the app keeps it: times are instants in milliseconds.
+// All-day events are the exception: start and end are wall dates (UTC
+// midnights), and end is exclusive (the day after the last day).
 export interface CalendarEvent {
   id: number;
   calendarId: number;
@@ -25,10 +30,26 @@ export interface CalendarEvent {
   description: string;
   // '' means "use the calendar color".
   color: string;
+  // Instants (ms), or wall dates for all-day events.
   start: number;
   end: number;
   // Minutes before the start.
   reminders: number[];
+  allDay: boolean;
+  repeat: Repeat;
+  // Every N days, weeks, months or years.
+  repeatInterval: number;
+  // Weekdays of a weekly event (0 = Sunday).
+  repeatWeekdays: number[];
+  // Last allowed occurrence start (ms), or null for never.
+  repeatUntil: number | null;
+
+  // Set on the occurrences of a repeating event by GET /api/events.
+  // `start`/`end` are this occurrence; `seriesStart`/`seriesEnd` are the
+  // stored event. Editing uses the series times.
+  occurrence?: number;
+  seriesStart?: number;
+  seriesEnd?: number;
 }
 
 // An event being created (no id yet) or edited in the form.
@@ -68,9 +89,17 @@ export interface Settings {
   animations: boolean;
   keyboardShortcuts: boolean;
   otherTimeZones: string[];
+  // First day of the week: 0 = Sunday, 1 = Monday, 6 = Saturday.
+  weekStart: number;
+  // The view the app opens in (also remembered across devices).
+  defaultView: View;
+  // Step for dragging events, in minutes (5, 10, 15 or 30).
+  snapMinutes: number;
+  // Calendar for new events, or 0 for the primary one.
+  defaultCalendarId: number;
 }
 
-export type View = 'day' | 'week' | 'month' | 'year';
+export type View = 'day' | 'week' | 'month' | 'year' | 'agenda';
 
 // Where a floating card opens: next to this rectangle (screen pixels).
 export interface Anchor {

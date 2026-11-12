@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	_ "modernc.org/sqlite" // pure Go SQLite driver (no CGO)
@@ -25,6 +26,24 @@ type Event struct {
 	End   time.Time `json:"end"`
 	// Reminders are notification times in minutes before the start (sorted, no duplicates).
 	Reminders []int `json:"reminders"`
+	// AllDay events use whole days. Start and End are UTC midnights of the
+	// calendar dates, so the dates do not move when the time zone changes.
+	// End is exclusive (the day after the last day).
+	AllDay bool `json:"allDay"`
+	// Repeat is "", "daily", "weekly", "monthly" or "yearly".
+	Repeat string `json:"repeat"`
+	// RepeatInterval is the number of days, weeks, months or years between
+	// occurrences (at least 1).
+	RepeatInterval int `json:"repeatInterval"`
+	// RepeatWeekdays are the weekdays of a weekly event (0 = Sunday).
+	RepeatWeekdays []int `json:"repeatWeekdays"`
+	// RepeatUntil is the last allowed occurrence start, or nil for never.
+	RepeatUntil *time.Time `json:"repeatUntil,omitempty"`
+	// The fields below are set on occurrences made by expanding a repeating
+	// event (GET /api/events). They are not stored.
+	Occurrence  *time.Time `json:"occurrence,omitempty"`
+	SeriesStart *time.Time `json:"seriesStart,omitempty"`
+	SeriesEnd   *time.Time `json:"seriesEnd,omitempty"`
 }
 
 // Calendar groups events, like "Work" or "Family". There is always one
@@ -60,16 +79,28 @@ type Store struct {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS events (
-	id          INTEGER PRIMARY KEY AUTOINCREMENT,
-	title       TEXT    NOT NULL DEFAULT '',
-	description TEXT    NOT NULL DEFAULT '',
-	color       TEXT    NOT NULL DEFAULT '',
-	start_ms    INTEGER NOT NULL,
-	end_ms      INTEGER NOT NULL,
-	created_at  INTEGER NOT NULL,
-	updated_at  INTEGER NOT NULL
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	title           TEXT    NOT NULL DEFAULT '',
+	description     TEXT    NOT NULL DEFAULT '',
+	color           TEXT    NOT NULL DEFAULT '',
+	start_ms        INTEGER NOT NULL,
+	end_ms          INTEGER NOT NULL,
+	all_day         INTEGER NOT NULL DEFAULT 0,
+	repeat_rule     TEXT    NOT NULL DEFAULT '',
+	repeat_interval INTEGER NOT NULL DEFAULT 1,
+	repeat_until    INTEGER NOT NULL DEFAULT 0,
+	repeat_weekdays TEXT    NOT NULL DEFAULT '[]',
+	created_at      INTEGER NOT NULL,
+	updated_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_start_end ON events(start_ms, end_ms);
+
+-- Occurrences of a repeating event that the user deleted.
+CREATE TABLE IF NOT EXISTS event_exceptions (
+	event_id      INTEGER NOT NULL,
+	occurrence_ms INTEGER NOT NULL,
+	PRIMARY KEY (event_id, occurrence_ms)
+);
 
 CREATE TABLE IF NOT EXISTS calendars (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,6 +168,32 @@ func migrate(db *sql.DB) error {
 		if _, err := tx.Exec(`ALTER TABLE events ADD COLUMN time_zone TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
+	}
+
+	// Events made before all-day events and repeating events existed.
+	newColumns := []struct{ name, def string }{
+		{"all_day", "INTEGER NOT NULL DEFAULT 0"},
+		{"repeat_rule", "TEXT NOT NULL DEFAULT ''"},
+		{"repeat_interval", "INTEGER NOT NULL DEFAULT 1"},
+		{"repeat_until", "INTEGER NOT NULL DEFAULT 0"},
+		{"repeat_weekdays", "TEXT NOT NULL DEFAULT '[]'"},
+	}
+	for _, c := range newColumns {
+		has, err := hasColumn(tx, "events", c.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := tx.Exec(`ALTER TABLE events ADD COLUMN ` + c.name + ` ` + c.def); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS event_exceptions (
+		event_id      INTEGER NOT NULL,
+		occurrence_ms INTEGER NOT NULL,
+		PRIMARY KEY (event_id, occurrence_ms))`); err != nil {
+		return err
 	}
 
 	// Calendar tables made before calendars had a time zone.
@@ -254,55 +311,128 @@ func toMs(t time.Time) int64    { return t.UnixMilli() }
 func fromMs(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
 func nowMs() int64              { return time.Now().UnixMilli() }
 
-// ListEvents returns events that overlap the range [from, to).
-func (s *Store) ListEvents(from, to time.Time) ([]Event, error) {
+// eventColumns is the column list every event query uses (see scanEvent).
+const eventColumns = `id, calendar_id, time_zone, title, description, color, start_ms, end_ms, reminders, all_day, repeat_rule, repeat_interval, repeat_until, repeat_weekdays`
+
+func scanEvent(row interface{ Scan(...any) error }) (Event, error) {
+	var e Event
+	var start, end, until int64
+	var reminders, weekdays string
+	err := row.Scan(&e.ID, &e.CalendarID, &e.TimeZone, &e.Title, &e.Description, &e.Color,
+		&start, &end, &reminders, &e.AllDay, &e.Repeat, &e.RepeatInterval, &until, &weekdays)
+	if err != nil {
+		return e, err
+	}
+	e.Start, e.End = fromMs(start), fromMs(end)
+	e.Reminders = decodeReminders(reminders)
+	e.RepeatWeekdays = decodeReminders(weekdays)
+	if until > 0 {
+		u := fromMs(until)
+		e.RepeatUntil = &u
+	}
+	return e, nil
+}
+
+// ListEvents returns events that overlap the range [from, to). Repeating events
+// are expanded into occurrences. tz is the primary time zone: repeating events
+// without a time zone keep their clock time there (also across DST changes).
+//
+// All-day events are stored as calendar dates, so they are fetched with one
+// day of slack on each side; the views draw only the days in range.
+func (s *Store) ListEvents(from, to time.Time, tz string) ([]Event, error) {
+	day := int64(24 * time.Hour / time.Millisecond)
 	rows, err := s.db.Query(`
-		SELECT id, calendar_id, time_zone, title, description, color, start_ms, end_ms, reminders
+		SELECT `+eventColumns+`
 		FROM events
-		WHERE start_ms < ? AND end_ms > ?
-		ORDER BY start_ms, end_ms DESC, id`, toMs(to), toMs(from))
+		WHERE (all_day = 0 AND start_ms < ? AND end_ms > ?)
+		   OR (all_day = 1 AND start_ms < ? AND end_ms > ?)
+		   OR (repeat_rule != '' AND start_ms < ? AND (repeat_until = 0 OR repeat_until >= ?))
+		ORDER BY start_ms, end_ms DESC, id`,
+		toMs(to), toMs(from),
+		toMs(to)+day, toMs(from)-day,
+		toMs(to), toMs(from))
+	if err != nil {
+		return nil, err
+	}
+	// Read the rows first and close them before any other query: the store has
+	// one connection, so a second query while these rows are open would wait
+	// forever.
+	stored := []Event{}
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		stored = append(stored, e)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	allExceptions, err := s.allExceptions()
+	if err != nil {
+		return nil, err
+	}
+
+	events := []Event{}
+	for _, e := range stored {
+		if e.Repeat == "" {
+			events = append(events, e)
+			continue
+		}
+		cancelled := make(map[int64]bool, len(allExceptions[e.ID]))
+		for _, ms := range allExceptions[e.ID] {
+			cancelled[ms] = true
+		}
+		events = append(events, expandOccurrences(e, cancelled, from, to, tz)...)
+	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].Start.Equal(events[j].Start) {
+			return events[i].ID < events[j].ID
+		}
+		return events[i].Start.Before(events[j].Start)
+	})
+	return events, nil
+}
+
+// AllEvents returns every event (repeating events are not expanded). Used by
+// the backup and iCalendar export.
+func (s *Store) AllEvents() ([]Event, error) {
+	rows, err := s.db.Query(`SELECT ` + eventColumns + ` FROM events ORDER BY start_ms, id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
 	events := []Event{}
 	for rows.Next() {
-		var e Event
-		var start, end int64
-		var reminders string
-		if err := rows.Scan(&e.ID, &e.CalendarID, &e.TimeZone, &e.Title, &e.Description, &e.Color, &start, &end, &reminders); err != nil {
+		e, err := scanEvent(rows)
+		if err != nil {
 			return nil, err
 		}
-		e.Start, e.End = fromMs(start), fromMs(end)
-		e.Reminders = decodeReminders(reminders)
 		events = append(events, e)
 	}
 	return events, rows.Err()
 }
 
 func (s *Store) GetEvent(id int64) (Event, error) {
-	var e Event
-	var start, end int64
-	var reminders string
-	err := s.db.QueryRow(`
-		SELECT id, calendar_id, time_zone, title, description, color, start_ms, end_ms, reminders
-		FROM events WHERE id = ?`, id).
-		Scan(&e.ID, &e.CalendarID, &e.TimeZone, &e.Title, &e.Description, &e.Color, &start, &end, &reminders)
+	e, err := scanEvent(s.db.QueryRow(`SELECT `+eventColumns+` FROM events WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return e, ErrNotFound
 	}
-	e.Start, e.End = fromMs(start), fromMs(end)
-	e.Reminders = decodeReminders(reminders)
 	return e, err
 }
 
 func (s *Store) CreateEvent(e Event) (Event, error) {
 	now := nowMs()
 	res, err := s.db.Exec(`
-		INSERT INTO events (calendar_id, time_zone, title, description, color, start_ms, end_ms, reminders, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.CalendarID, e.TimeZone, e.Title, e.Description, e.Color, toMs(e.Start), toMs(e.End), encodeReminders(e.Reminders), now, now)
+		INSERT INTO events (calendar_id, time_zone, title, description, color, start_ms, end_ms, reminders,
+			all_day, repeat_rule, repeat_interval, repeat_until, repeat_weekdays, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.CalendarID, e.TimeZone, e.Title, e.Description, e.Color, toMs(e.Start), toMs(e.End), encodeReminders(e.Reminders),
+		e.AllDay, e.Repeat, e.RepeatInterval, repeatUntilMs(e.RepeatUntil), encodeReminders(e.RepeatWeekdays), now, now)
 	if err != nil {
 		return e, err
 	}
@@ -313,12 +443,21 @@ func (s *Store) CreateEvent(e Event) (Event, error) {
 	return s.GetEvent(id)
 }
 
+func repeatUntilMs(t *time.Time) int64 {
+	if t == nil || t.IsZero() {
+		return 0
+	}
+	return toMs(*t)
+}
+
 func (s *Store) UpdateEvent(e Event) (Event, error) {
 	res, err := s.db.Exec(`
 		UPDATE events
-		SET calendar_id = ?, time_zone = ?, title = ?, description = ?, color = ?, start_ms = ?, end_ms = ?, reminders = ?, updated_at = ?
+		SET calendar_id = ?, time_zone = ?, title = ?, description = ?, color = ?, start_ms = ?, end_ms = ?, reminders = ?,
+			all_day = ?, repeat_rule = ?, repeat_interval = ?, repeat_until = ?, repeat_weekdays = ?, updated_at = ?
 		WHERE id = ?`,
-		e.CalendarID, e.TimeZone, e.Title, e.Description, e.Color, toMs(e.Start), toMs(e.End), encodeReminders(e.Reminders), nowMs(), e.ID)
+		e.CalendarID, e.TimeZone, e.Title, e.Description, e.Color, toMs(e.Start), toMs(e.End), encodeReminders(e.Reminders),
+		e.AllDay, e.Repeat, e.RepeatInterval, repeatUntilMs(e.RepeatUntil), encodeReminders(e.RepeatWeekdays), nowMs(), e.ID)
 	if err != nil {
 		return e, err
 	}
@@ -329,14 +468,55 @@ func (s *Store) UpdateEvent(e Event) (Event, error) {
 }
 
 func (s *Store) DeleteEvent(id int64) error {
-	res, err := s.db.Exec(`DELETE FROM events WHERE id = ?`, id)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM event_exceptions WHERE event_id = ?`, id); err != nil {
+		return err
+	}
+	res, err := tx.Exec(`DELETE FROM events WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit()
+}
+
+// exceptions lists the deleted occurrences of a repeating event.
+func (s *Store) exceptions(id int64) (map[int64]bool, error) {
+	rows, err := s.db.Query(`SELECT occurrence_ms FROM event_exceptions WHERE event_id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var ms int64
+		if err := rows.Scan(&ms); err != nil {
+			return nil, err
+		}
+		out[ms] = true
+	}
+	return out, rows.Err()
+}
+
+var ErrNotRepeating = errors.New("event does not repeat")
+
+// DeleteOccurrence deletes one occurrence of a repeating event.
+func (s *Store) DeleteOccurrence(id, occurrenceMs int64) error {
+	e, err := s.GetEvent(id)
+	if err != nil {
+		return err
+	}
+	if e.Repeat == "" {
+		return ErrNotRepeating
+	}
+	_, err = s.db.Exec(`INSERT OR IGNORE INTO event_exceptions (event_id, occurrence_ms) VALUES (?, ?)`, id, occurrenceMs)
+	return err
 }
 
 // ---- Calendars ----
@@ -436,6 +616,9 @@ func (s *Store) DeleteCalendar(id int64) error {
 	}
 	if primary {
 		return ErrPrimary
+	}
+	if _, err := tx.Exec(`DELETE FROM event_exceptions WHERE event_id IN (SELECT id FROM events WHERE calendar_id = ?)`, id); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM events WHERE calendar_id = ?`, id); err != nil {
 		return err

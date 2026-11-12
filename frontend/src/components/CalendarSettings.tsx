@@ -192,7 +192,10 @@ export function CalendarSettings({
           </p>
         ) : (
           <>
-            <p className="settings-note">Deleting this calendar also deletes all of its events. This cannot be undone.</p>
+            <p className="settings-note">
+              Deleting this calendar also deletes all of its events. You can undo this right after, with the button
+              in the message at the bottom.
+            </p>
             <button type="button" className="outline-btn danger" onClick={() => setConfirm(true)}>
               Delete
             </button>
@@ -204,7 +207,7 @@ export function CalendarSettings({
         <ConfirmDialog
           key={`confirm-${confirmExit.key}`}
           title="Delete calendar?"
-          text={`All events in "${calendar.name}" will be deleted. This cannot be undone.`}
+          text={`All events in "${calendar.name}" will be deleted. You can undo this right after.`}
           action="Delete"
           closing={confirmExit.phase === 'exit'}
           onCancel={() => setConfirm(false)}

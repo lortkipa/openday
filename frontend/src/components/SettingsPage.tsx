@@ -11,10 +11,18 @@ import { REMINDER_PRESETS, notificationPermission, requestNotificationPermission
 import type { ReactNode } from 'react';
 import type { Option } from './DropdownList';
 import type { Permission } from '../notifications';
-import type { Calendar, CalendarPatch, DateFormat, NotificationMode, Settings, TimeFormat } from '../types';
+import type { Calendar, CalendarPatch, DateFormat, NotificationMode, Settings, TimeFormat, View } from '../types';
 
 const DURATIONS = [15, 20, 30, 45, 60, 90, 120];
 const SNOOZE_OPTIONS = [0, 1, 5, 10, 15, 30];
+
+const VIEW_OPTIONS: Option<View>[] = [
+  { value: 'day', label: 'Day' },
+  { value: 'week', label: 'Week' },
+  { value: 'month', label: 'Month' },
+  { value: 'year', label: 'Year' },
+  { value: 'agenda', label: 'Schedule' },
+];
 
 const NOTIFY_OPTIONS: Option<NotificationMode>[] = [
   { value: 'off', label: 'Off' },
@@ -177,8 +185,8 @@ function NavItem({
   return (
     <button
       type="button"
-      className={`settings-nav-item ${active ? 'active' : ''}`}
       aria-current={active ? 'page' : undefined}
+      className={`settings-nav-item ${active ? 'active' : ''}`}
       onClick={onClick}
       title={title}
     >
@@ -198,6 +206,7 @@ interface SettingsPageProps {
   onDeleteCalendar: (id: number) => Promise<boolean>;
   showShortcuts: boolean;
   onViewShortcuts: () => void;
+  onRestore: (data: unknown) => Promise<{ calendars: number; events: number }>;
 }
 
 type Group = 'general' | 'add' | 'mine';
@@ -212,7 +221,7 @@ type Group = 'general' | 'add' | 'mine';
 // `focus`: the page to open first ("create-calendar", "calendar-3"), or null.
 export default function SettingsPage({
   settings, onChange, onBack, focus, calendars, onCreateCalendar, onUpdateCalendar, onDeleteCalendar,
-  showShortcuts, onViewShortcuts,
+  showShortcuts, onViewShortcuts, onRestore,
 }: SettingsPageProps) {
   const narrow = useMedia(NARROW);
   const primaryZone = settings.timeZone || T.browserTimeZone();
@@ -237,6 +246,32 @@ export default function SettingsPage({
   const [permission, setPermission] = useState<Permission>(notificationPermission);
   const askPermission = async () => setPermission(await requestNotificationPermission());
 
+  // Restore: read a backup file, ask, then import it.
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [pending, setPending] = useState<unknown>(null);
+  const [restoreNote, setRestoreNote] = useState<string | null>(null);
+  const readBackup = async (file: File | undefined) => {
+    if (!file) return;
+    setRestoreNote(null);
+    try {
+      const data = JSON.parse(await file.text());
+      if (!data || typeof data !== 'object') throw new Error('That file is not an OpenDay backup.');
+      setPending(data);
+    } catch (err) {
+      setRestoreNote(err instanceof Error ? err.message : 'Could not read that file.');
+    }
+  };
+  const restore = async () => {
+    if (pending === null) return;
+    try {
+      const res = await onRestore(pending);
+      setPending(null);
+      setRestoreNote(`Restored ${res.calendars} calendar(s) and ${res.events} event(s).`);
+    } catch (err) {
+      setRestoreNote(err instanceof Error ? err.message : 'The backup could not be restored.');
+    }
+  };
+
   const [page, setPage] = useState(focus || 'general');
   // The open group of the menu. Opening a page opens its group and closes the others.
   const groupOf = (p: string): Group => (p === 'general' ? 'general' : p === 'create-calendar' ? 'add' : 'mine');
@@ -252,8 +287,10 @@ export default function SettingsPage({
     { id: 'date-time', title: 'Date and time format' },
     { id: 'time-zone', title: 'Time zone' },
     { id: 'event-settings', title: 'Event settings' },
+    { id: 'view-options', title: 'View options' },
     { id: 'notifications', title: 'Notification settings' },
     { id: 'appearance', title: 'Appearance' },
+    { id: 'data', title: 'Backup and export' },
     ...(showShortcuts ? [{ id: 'shortcuts', title: 'Keyboard shortcuts' }] : []),
   ];
 
@@ -433,6 +470,46 @@ export default function SettingsPage({
           </Field>
         </section>
 
+        <section id="view-options">
+          <h2>View options</h2>
+          <Field label="Start week on">
+            <Select
+              value={settings.weekStart}
+              onChange={(weekStart) => onChange({ weekStart })}
+              options={[
+                { value: 0, label: 'Sunday' },
+                { value: 1, label: 'Monday' },
+                { value: 6, label: 'Saturday' },
+              ]}
+            />
+          </Field>
+          <Field label="Default view">
+            <Select
+              value={settings.defaultView}
+              onChange={(defaultView) => onChange({ defaultView })}
+              options={VIEW_OPTIONS}
+            />
+          </Field>
+          <Field label="Time step when dragging">
+            <Select
+              value={settings.snapMinutes}
+              onChange={(snapMinutes) => onChange({ snapMinutes })}
+              options={[5, 10, 15, 30].map((m) => ({ value: m, label: `${m} minutes` }))}
+            />
+          </Field>
+          <Field label="Default calendar for new events">
+            <Select
+              value={settings.defaultCalendarId}
+              onChange={(defaultCalendarId) => onChange({ defaultCalendarId })}
+              options={[
+                { value: 0, label: 'Primary calendar' },
+                ...calendars.map((c) => ({ value: c.id, label: c.name, color: c.color })),
+              ]}
+            />
+          </Field>
+          <p className="settings-note">The default view is also the last view you used.</p>
+        </section>
+
         <section id="notifications">
           <h2>Notification settings</h2>
           <Field label="Notifications">
@@ -485,6 +562,41 @@ export default function SettingsPage({
           </label>
           {settings.animations && deviceReducesMotion() && (
             <p className="settings-note">Your device is set to reduce motion, so animations are not shown.</p>
+          )}
+        </section>
+
+        <section id="data">
+          <h2>Backup and export</h2>
+          <p className="settings-note">
+            A backup contains all calendars, events and settings. Restoring a backup adds its data; it never
+            deletes anything.
+          </p>
+          <div className="settings-actions">
+            <a className="outline-btn" href="/api/export" download>
+              <Icon name="download" size={18} /> Download backup
+            </a>
+            <a className="outline-btn" href="/api/export.ics" download>
+              <Icon name="calendar" size={18} /> Export as iCalendar
+            </a>
+            <button type="button" className="outline-btn" onClick={() => fileRef.current?.click()}>
+              <Icon name="arrowBack" size={18} /> Restore backup…
+            </button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/json,.json"
+              hidden
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                void readBackup(file);
+              }}
+            />
+          </div>
+          {restoreNote && (
+            <p className="settings-note" role="status">
+              {restoreNote}
+            </p>
           )}
         </section>
 
@@ -544,6 +656,28 @@ export default function SettingsPage({
           {content}
         </div>
       </div>
+
+      {pending !== null && (
+        <div
+          className="modal-backdrop"
+          onPointerDown={(e) => e.target === e.currentTarget && setPending(null)}
+        >
+          <div className="modal" role="alertdialog" aria-label="Restore backup">
+            <h2>Restore this backup?</h2>
+            <p className="modal-text">
+              Its calendars and events will be added. Existing calendars, events and settings are kept.
+            </p>
+            <div className="modal-foot">
+              <button type="button" className="text-btn" onClick={() => setPending(null)}>
+                Cancel
+              </button>
+              <button type="button" className="filled-btn" onClick={restore}>
+                Restore
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

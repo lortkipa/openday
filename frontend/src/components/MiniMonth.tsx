@@ -11,15 +11,25 @@ interface MiniMonthProps {
   // Year view: always show this month (no month buttons).
   month?: number;
   variant?: 'small' | 'year';
+  // First day of the week: 0 = Sunday, 1 = Monday, 6 = Saturday.
+  weekStart?: number;
 }
 
-export default function MiniMonth({ value, today, onPick, month: fixedMonth, variant = 'small' }: MiniMonthProps) {
+export default function MiniMonth({
+  value,
+  today,
+  onPick,
+  month: fixedMonth,
+  variant = 'small',
+  weekStart = 0,
+}: MiniMonthProps) {
   const [shown, setShown] = useState(() => T.startOfMonth(fixedMonth ?? value ?? today));
   useEffect(() => {
     setShown(T.startOfMonth(fixedMonth ?? value ?? today));
   }, [fixedMonth, value, today]);
 
-  const days = T.monthGridDays(shown);
+  const days = T.monthGridDays(shown, weekStart);
+  const dows = Array.from({ length: 7 }, (_, i) => T.WEEKDAYS[(weekStart + i) % 7]);
   // Always show 6 rows so the sidebar does not jump.
   while (days.length < 42) days.push(T.addDays(days[days.length - 1], 1));
   const [y, m] = T.ymd(shown);
@@ -40,7 +50,7 @@ export default function MiniMonth({ value, today, onPick, month: fixedMonth, var
         )}
       </div>
       <div className="mini-grid" role="grid">
-        {T.WEEKDAYS.map((d) => (
+        {dows.map((d) => (
           <span key={d} className="mini-dow" aria-hidden="true">
             {d[0]}
           </span>

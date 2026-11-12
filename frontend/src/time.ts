@@ -86,7 +86,9 @@ export function zoneLabel(tz: string, instant: number): string {
 export const startOfDay = (w: number): number => w - (((w % DAY) + DAY) % DAY);
 export const addDays = (w: number, n: number): number => w + n * DAY;
 export const dayOfWeek = (w: number): number => new Date(w).getUTCDay();
-export const startOfWeek = (w: number): number => addDays(startOfDay(w), -dayOfWeek(w));
+// First day of the week: weekStart 0 = Sunday, 1 = Monday, 6 = Saturday.
+export const startOfWeek = (w: number, weekStart = 0): number =>
+  addDays(startOfDay(w), -(((dayOfWeek(w) - weekStart) % 7) + 7) % 7);
 export const ymd = (w: number): [number, number, number] => {
   const d = new Date(w);
   return [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()];
@@ -108,10 +110,10 @@ export const minutesOfDay = (w: number): number => Math.round((w - startOfDay(w)
 export const sameDay = (a: number, b: number): boolean => startOfDay(a) === startOfDay(b);
 
 // Days shown in a month grid: whole weeks covering the month (5 or 6 rows).
-export function monthGridDays(w: number): number[] {
+export function monthGridDays(w: number, weekStart = 0): number[] {
   const first = startOfMonth(w);
   const [y, m] = ymd(first);
-  const start = startOfWeek(first);
+  const start = startOfWeek(first, weekStart);
   const lastDay = makeDay(y, m, daysInMonth(y, m));
   const weeks = Math.ceil((lastDay - start) / DAY / 7 + 1 / 7);
   return Array.from({ length: weeks * 7 }, (_, i) => addDays(start, i));
@@ -208,6 +210,43 @@ export function parseTime(text: string, timeFormat: TimeFormat, partial = false)
     return h === 12 ? [m, 12 * 60 + m] : [h * 60 + m, (h + 12) * 60 + m];
   }
   return [h * 60 + m];
+}
+
+// ---- All-day events and repeating events ----
+
+// Inclusive end date of an all-day event (end is stored exclusive).
+export const allDayEnd = (we: number): number => we - DAY;
+
+// "11/13/2026" or "11/13/2026 – 11/15/2026" for an all-day event.
+export function formatAllDayDate(start: number, endExclusive: number, dateFormat: DateFormat): string {
+  const end = allDayEnd(endExclusive);
+  if (startOfDay(start) === startOfDay(end)) return formatDate(start, dateFormat);
+  return `${formatDate(start, dateFormat)} – ${formatDate(end, dateFormat)}`;
+}
+
+// "Friday, 11/13/2026" or "Friday, 11/13/2026 – Sunday, 11/15/2026".
+export function formatAllDayLong(start: number, endExclusive: number, dateFormat: DateFormat): string {
+  const end = allDayEnd(endExclusive);
+  if (startOfDay(start) === startOfDay(end)) {
+    return `${weekdayName(start)}, ${formatDate(start, dateFormat)}`;
+  }
+  return `${weekdayName(start)}, ${formatDate(start, dateFormat)} – ${weekdayName(end)}, ${formatDate(end, dateFormat)}`;
+}
+
+// "Does not repeat", "Every 2 weeks on Monday and Wednesday".
+export function formatRepeat(repeat: string, interval: number, weekdays: number[]): string {
+  if (!repeat) return 'Does not repeat';
+  const n = Math.max(1, interval || 1);
+  const every = n === 1 ? 'Every' : `Every ${n}`;
+  const unit =
+    repeat === 'daily' ? 'day' : repeat === 'weekly' ? 'week' : repeat === 'monthly' ? 'month' : 'year';
+  let text = `${every} ${unit}${n === 1 ? '' : 's'}`;
+  if (repeat === 'weekly' && weekdays.length > 0) {
+    const names = [...weekdays].sort((a, b) => a - b).map((d) => WEEKDAYS[d]);
+    const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+    text += ` on ${list}`;
+  }
+  return text;
 }
 
 // Notification times, in minutes before the event start.

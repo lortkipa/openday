@@ -92,6 +92,43 @@ export default function Popover({
     window.addEventListener('pointercancel', up);
   };
 
+  // Cards and sheets behave like dialogs: focus moves inside, Tab stays
+  // inside, and focus returns to where it was when the card closes.
+  useEffect(() => {
+    if (closing || !(modal || sheet)) return undefined;
+    const el = ref.current;
+    if (!el) return undefined;
+    const previous = document.activeElement as HTMLElement | null;
+    const focusable = () =>
+      Array.from(
+        el.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((node) => node.offsetParent !== null);
+    (focusable()[0] || el).focus({ preventScroll: true });
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab') return;
+      const list = focusable();
+      if (!list.length) {
+        e.preventDefault();
+        return;
+      }
+      const i = list.indexOf(document.activeElement as HTMLElement);
+      if (e.shiftKey && i <= 0) {
+        e.preventDefault();
+        list[list.length - 1].focus();
+      } else if (!e.shiftKey && (i === list.length - 1 || i === -1)) {
+        e.preventDefault();
+        list[0].focus();
+      }
+    };
+    el.addEventListener('keydown', onKey);
+    return () => {
+      el.removeEventListener('keydown', onKey);
+      previous?.focus?.({ preventScroll: true });
+    };
+  }, [closing, modal, sheet]);
+
   useEffect(() => {
     if (closing) return undefined;
     const onDown = (e: PointerEvent) => {
@@ -112,6 +149,8 @@ export default function Popover({
       role="dialog"
       aria-label={label}
       aria-hidden={closing || undefined}
+      aria-modal={modal || sheet || undefined}
+      tabIndex={-1}
       inert={closing || undefined}
       data-popover
       onPointerDown={onPointerDown}

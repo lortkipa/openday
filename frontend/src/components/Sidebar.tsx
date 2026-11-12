@@ -17,6 +17,7 @@ interface SidebarProps {
   onPick: (day: number) => void;
   onOpenSettings: () => void;
   shortcuts: boolean;
+  weekStart: number;
   calendarList: CalendarListProps;
 }
 
@@ -28,6 +29,7 @@ export default function Sidebar({
   onPick,
   onOpenSettings,
   shortcuts,
+  weekStart,
   calendarList,
 }: SidebarProps) {
   const closing = phase === 'exit';
@@ -37,7 +39,7 @@ export default function Sidebar({
         <Icon name="add" size={28} className="create-plus" />
         <span>Create</span>
       </button>
-      <MiniMonth value={T.startOfDay(cursor)} today={today} onPick={onPick} />
+      <MiniMonth value={T.startOfDay(cursor)} today={today} onPick={onPick} weekStart={weekStart} />
       <CalendarList {...calendarList} />
       {/* Phones only (the header has the settings button on bigger screens). */}
       <button className="sidebar-settings" onClick={onOpenSettings}>

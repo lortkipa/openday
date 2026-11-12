@@ -4,12 +4,16 @@ import { colorOf } from '../colors';
 import * as T from '../time';
 import type { Anchor, Calendar, CalendarEvent, Settings } from '../types';
 
-// "Friday, 11/06/2026 · 10 – 11am"
+// "Friday, 11/06/2026 · 10 – 11am" or "All day · Friday, 11/06/2026"
 export function describeWhen(
-  event: { start: number; end: number },
+  event: { start: number; end: number; allDay?: boolean },
   tz: string,
   settings: Pick<Settings, 'dateFormat' | 'timeFormat'>,
 ): string {
+  if (event.allDay) {
+    // All-day events keep calendar dates, not instants: no time zone applies.
+    return `All day · ${T.formatAllDayLong(event.start, event.end, settings.dateFormat)}`;
+  }
   const ws = T.toWall(event.start, tz);
   const we = T.toWall(event.end, tz);
   const date = (w: number) => `${T.weekdayName(w)}, ${T.formatDate(w, settings.dateFormat)}`;
@@ -29,6 +33,7 @@ interface EventDetailsProps {
   onClose: () => void;
   onEdit: () => void;
   onDelete: () => void;
+  onDuplicate: () => void;
 }
 
 export default function EventDetails({
@@ -41,12 +46,16 @@ export default function EventDetails({
   onClose,
   onEdit,
   onDelete,
+  onDuplicate,
 }: EventDetailsProps) {
   return (
     <Popover anchor={anchor} onClose={onClose} closing={closing} className="details" label="Event details">
       <div className="details-bar" data-drag-handle>
         <button className="icon-btn sm" onClick={onEdit} aria-label="Edit event" title="Edit event">
           <Icon name="edit" size={20} />
+        </button>
+        <button className="icon-btn sm" onClick={onDuplicate} aria-label="Duplicate event" title="Duplicate event">
+          <Icon name="contentCopy" size={20} />
         </button>
         <button className="icon-btn sm" onClick={onDelete} aria-label="Delete event" title="Delete event">
           <Icon name="delete" size={20} />
@@ -61,7 +70,7 @@ export default function EventDetails({
           <div className="details-title">{event.title || '(No title)'}</div>
           <div className="details-when">{describeWhen(event, tz, settings)}</div>
           {/* Set in another time zone: also show the time there. */}
-          {event.timeZone && event.timeZone !== tz && (
+          {!event.allDay && event.timeZone && event.timeZone !== tz && (
             <div className="details-when">
               {describeWhen(event, event.timeZone, settings)} ({T.zoneCity(event.timeZone)})
             </div>
@@ -72,6 +81,20 @@ export default function EventDetails({
         <div className="details-row">
           <Icon name="notes" size={20} className="row-icon" />
           <div className="details-desc">{event.description}</div>
+        </div>
+      )}
+      {event.repeat && (
+        <div className="details-row">
+          <Icon name="repeat" size={20} className="row-icon" />
+          <div className="details-desc">
+            {T.formatRepeat(event.repeat, event.repeatInterval, event.repeatWeekdays)}
+            {event.repeatUntil
+              ? `, until ${T.formatDate(
+                  event.allDay ? event.repeatUntil : T.toWall(event.repeatUntil, tz),
+                  settings.dateFormat,
+                )}`
+              : ''}
+          </div>
         </div>
       )}
       {event.reminders.length > 0 && (

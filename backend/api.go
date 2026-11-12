@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -36,6 +38,10 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/calendars/{id}", h.notify(a.deleteCalendar, "calendars", "events"))
 	mux.HandleFunc("GET /api/settings", a.getSettings)
 	mux.HandleFunc("PUT /api/settings", h.notify(a.putSettings, "settings"))
+	// Backup, restore and iCalendar export.
+	mux.HandleFunc("GET /api/export", a.exportBackup)
+	mux.HandleFunc("GET /api/export.ics", a.exportICS)
+	mux.HandleFunc("POST /api/import", h.notify(a.importData, "calendars", "events"))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
@@ -69,6 +75,13 @@ type eventInput struct {
 	Start       time.Time `json:"start"`
 	End         time.Time `json:"end"`
 	Reminders   []int     `json:"reminders"`
+	// All-day events use whole days (start and end at UTC midnight; end exclusive).
+	AllDay bool `json:"allDay"`
+	// Repeat is "", "daily", "weekly", "monthly" or "yearly".
+	Repeat         string     `json:"repeat"`
+	RepeatInterval int        `json:"repeatInterval"`
+	RepeatWeekdays []int      `json:"repeatWeekdays"`
+	RepeatUntil    *time.Time `json:"repeatUntil"`
 }
 
 func (in eventInput) validate() (Event, error) {
@@ -81,6 +94,8 @@ func (in eventInput) validate() (Event, error) {
 		Start:       in.Start.UTC(),
 		End:         in.End.UTC(),
 		Reminders:   []int{},
+		AllDay:      in.AllDay,
+		Repeat:      in.Repeat,
 	}
 	for _, m := range in.Reminders {
 		if m < 0 || m > maxReminderMins {
@@ -108,6 +123,53 @@ func (in eventInput) validate() (Event, error) {
 		return e, errors.New("color must look like #1a2b3c")
 	case !validTimeZone(e.TimeZone):
 		return e, errors.New("invalid timeZone")
+	}
+
+	if e.AllDay {
+		// Dates only: start and end are UTC midnights, and the time zone does
+		// not apply (the date stays the same everywhere).
+		dayMs := int64(24 * time.Hour / time.Millisecond)
+		if e.Start.UnixMilli()%dayMs != 0 || e.End.UnixMilli()%dayMs != 0 {
+			return e, errors.New("all-day events must start and end at midnight")
+		}
+		e.TimeZone = ""
+	}
+
+	// Repeating events.
+	e.RepeatInterval = in.RepeatInterval
+	if e.RepeatInterval == 0 {
+		e.RepeatInterval = 1
+	}
+	e.RepeatWeekdays = []int{}
+	e.RepeatUntil = in.RepeatUntil
+	if e.Repeat == "" {
+		e.RepeatInterval = 1
+		e.RepeatUntil = nil
+	} else {
+		if !contains([]string{"daily", "weekly", "monthly", "yearly"}, e.Repeat) {
+			return e, errors.New("repeat must be daily, weekly, monthly or yearly")
+		}
+		if e.RepeatInterval < 1 || e.RepeatInterval > 99 {
+			return e, errors.New("repeatInterval must be between 1 and 99")
+		}
+		if e.Repeat == "weekly" {
+			for _, d := range in.RepeatWeekdays {
+				if d < 0 || d > 6 {
+					return e, errors.New("repeatWeekdays must be days of the week (0 to 6)")
+				}
+				if !contains(e.RepeatWeekdays, d) {
+					e.RepeatWeekdays = append(e.RepeatWeekdays, d)
+				}
+			}
+			sort.Ints(e.RepeatWeekdays)
+		}
+		if e.RepeatUntil != nil {
+			until := e.RepeatUntil.UTC()
+			e.RepeatUntil = &until
+			if !until.After(e.Start) {
+				return e, errors.New("the repeat end must be after the start")
+			}
+		}
 	}
 	return e, nil
 }
@@ -142,7 +204,13 @@ func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "start and end query parameters must be RFC 3339 times")
 		return
 	}
-	events, err := a.store.ListEvents(from, to)
+	// The primary time zone keeps repeating events at their clock time.
+	tz := r.URL.Query().Get("tz")
+	if !validTimeZone(tz) {
+		writeError(w, http.StatusBadRequest, "invalid tz")
+		return
+	}
+	events, err := a.store.ListEvents(from, to, tz)
 	if err != nil {
 		serverError(w, err)
 		return
@@ -196,6 +264,27 @@ func (a *API) updateEvent(w http.ResponseWriter, r *http.Request) {
 func (a *API) deleteEvent(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
+		return
+	}
+	// ?occurrence=<RFC 3339 start> deletes one occurrence of a repeating
+	// event instead of the whole series.
+	if raw := r.URL.Query().Get("occurrence"); raw != "" {
+		occ, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "occurrence must be an RFC 3339 time")
+			return
+		}
+		err = a.store.DeleteOccurrence(id, occ.UnixMilli())
+		switch {
+		case errors.Is(err, ErrNotFound):
+			writeError(w, http.StatusNotFound, "event not found")
+		case errors.Is(err, ErrNotRepeating):
+			writeError(w, http.StatusBadRequest, "this event does not repeat")
+		case err != nil:
+			serverError(w, err)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
 		return
 	}
 	err := a.store.DeleteEvent(id)
@@ -399,6 +488,14 @@ type Settings struct {
 	// OtherTimeZones: extra time zones (IANA names) shown next to the
 	// primary one in the day/week grid and offered in the event form.
 	OtherTimeZones []string `json:"otherTimeZones"`
+	// WeekStart: the first day of the week (0 = Sunday, 1 = Monday, 6 = Saturday).
+	WeekStart int `json:"weekStart"`
+	// DefaultView: the view the app opens in (last used view).
+	DefaultView string `json:"defaultView"`
+	// SnapMinutes: the step for dragging events (5, 10, 15 or 30 minutes).
+	SnapMinutes int `json:"snapMinutes"`
+	// DefaultCalendarID: the calendar for new events, or 0 for the primary one.
+	DefaultCalendarID int64 `json:"defaultCalendarId"`
 }
 
 var defaultSettings = Settings{
@@ -416,6 +513,11 @@ var defaultSettings = Settings{
 	Animations:        true,
 	KeyboardShortcuts: true,
 	OtherTimeZones:    []string{},
+
+	WeekStart:         0,
+	DefaultView:       "week",
+	SnapMinutes:       15,
+	DefaultCalendarID: 0,
 }
 
 var (
@@ -426,6 +528,9 @@ var (
 	allowedNotify      = []string{"off", "desktop", "alerts"}
 	allowedSnooze      = []int{0, 1, 5, 10, 15, 30}
 	allowedDefaultRem  = []int{-1, 0, 5, 10, 15, 30, 60, 120, 1440, 2880, 10080}
+	allowedWeekStarts  = []int{0, 1, 6}
+	allowedViews       = []string{"day", "week", "month", "year", "agenda"}
+	allowedSnaps       = []int{5, 10, 15, 30}
 )
 
 func intSetting(raw map[string]string, key string, allowed []int, dst *int) {
@@ -490,6 +595,16 @@ func (a *API) loadSettings() (Settings, error) {
 			}
 		}
 	}
+	intSetting(raw, "weekStart", allowedWeekStarts, &s.WeekStart)
+	if v, ok := raw["defaultView"]; ok && contains(allowedViews, v) {
+		s.DefaultView = v
+	}
+	intSetting(raw, "snapMinutes", allowedSnaps, &s.SnapMinutes)
+	if v, ok := raw["defaultCalendarId"]; ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			s.DefaultCalendarID = n
+		}
+	}
 	return s, nil
 }
 
@@ -520,6 +635,11 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 		KeyboardShortcuts *bool `json:"keyboardShortcuts"`
 
 		OtherTimeZones *[]string `json:"otherTimeZones"`
+
+		WeekStart         *int    `json:"weekStart"`
+		DefaultView       *string `json:"defaultView"`
+		SnapMinutes       *int    `json:"snapMinutes"`
+		DefaultCalendarID *int64  `json:"defaultCalendarId"`
 	}
 	if !readJSON(w, r, &in) {
 		return
@@ -601,11 +721,106 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 		b, _ := json.Marshal(zones)
 		values["otherTimeZones"] = string(b)
 	}
+	if in.WeekStart != nil {
+		if !contains(allowedWeekStarts, *in.WeekStart) {
+			writeError(w, http.StatusBadRequest, "invalid weekStart")
+			return
+		}
+		values["weekStart"] = strconv.Itoa(*in.WeekStart)
+	}
+	if in.DefaultView != nil {
+		if !contains(allowedViews, *in.DefaultView) {
+			writeError(w, http.StatusBadRequest, "invalid defaultView")
+			return
+		}
+		values["defaultView"] = *in.DefaultView
+	}
+	if in.SnapMinutes != nil {
+		if !contains(allowedSnaps, *in.SnapMinutes) {
+			writeError(w, http.StatusBadRequest, "invalid snapMinutes")
+			return
+		}
+		values["snapMinutes"] = strconv.Itoa(*in.SnapMinutes)
+	}
+	if in.DefaultCalendarID != nil {
+		if *in.DefaultCalendarID < 0 {
+			writeError(w, http.StatusBadRequest, "invalid defaultCalendarId")
+			return
+		}
+		values["defaultCalendarId"] = strconv.FormatInt(*in.DefaultCalendarID, 10)
+	}
 	if err := a.store.SetSettings(values); err != nil {
 		serverError(w, err)
 		return
 	}
 	a.getSettings(w, r)
+}
+
+// ---- Backup, restore, export ----
+
+// GET /api/export[?calendar=<id>] downloads a JSON backup.
+func (a *API) exportBackup(w http.ResponseWriter, r *http.Request) {
+	id := int64(0)
+	if raw := r.URL.Query().Get("calendar"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid calendar")
+			return
+		}
+		id = n
+	}
+	b, err := a.makeBackup(id)
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusNotFound, "calendar not found")
+		return
+	}
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	name := "openday-backup.json"
+	if id > 0 {
+		name = fmt.Sprintf("openday-calendar-%d.json", id)
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	writeJSON(w, http.StatusOK, b)
+}
+
+// GET /api/export.ics downloads every event as an iCalendar file.
+func (a *API) exportICS(w http.ResponseWriter, r *http.Request) {
+	events, err := a.store.AllEvents()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	exceptions, err := a.store.allExceptions()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/calendar; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="openday.ics"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, icsText(events, exceptions))
+}
+
+// POST /api/import restores a backup (or undoes deleting a calendar).
+// It only adds data; nothing is overwritten or removed.
+func (a *API) importData(w http.ResponseWriter, r *http.Request) {
+	var b Backup
+	if !readJSON(w, r, &b) {
+		return
+	}
+	calendars, events, err := a.importBackup(b)
+	switch {
+	case errors.Is(err, errTooMuchData):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case err != nil:
+		serverError(w, err)
+	default:
+		writeJSON(w, http.StatusOK, map[string]int{"calendars": calendars, "events": events})
+	}
 }
 
 // ---- Helpers ----

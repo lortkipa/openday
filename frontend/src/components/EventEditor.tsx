@@ -11,7 +11,7 @@ import { calendarZone } from '../calendars';
 import * as T from '../time';
 import { useMedia, TOUCH } from '../useMedia';
 import type { FormEvent, ReactNode, RefObject } from 'react';
-import type { Anchor, Calendar, Draft, Settings } from '../types';
+import type { Anchor, Calendar, Draft, Repeat, Settings } from '../types';
 
 interface EventEditorProps {
   draft: Draft;
@@ -38,20 +38,26 @@ export default function EventEditor({
 }: EventEditorProps) {
   const titleRef = useRef<HTMLInputElement>(null);
   const [picker, setPicker] = useState(false);
+  const [pickerEnd, setPickerEnd] = useState(false);
+  const [pickerUntil, setPickerUntil] = useState(false);
   const dateBtnRef = useRef<HTMLButtonElement>(null);
+  const endBtnRef = useRef<HTMLButtonElement>(null);
+  const untilBtnRef = useRef<HTMLButtonElement>(null);
   const isNew = !draft.id;
   const touch = useMedia(TOUCH);
 
-  // Close the date picker on a press outside it and its button.
+  // Close a date picker on a press outside it and its button.
   useEffect(() => {
-    if (!picker) return;
+    if (!picker && !pickerEnd && !pickerUntil) return;
     const outside = (e: PointerEvent) => {
       if ((e.target as Element | null)?.closest?.('.date-field, .date-picker')) return;
       setPicker(false);
+      setPickerEnd(false);
+      setPickerUntil(false);
     };
     document.addEventListener('pointerdown', outside, true);
     return () => document.removeEventListener('pointerdown', outside, true);
-  }, [picker]);
+  }, [picker, pickerEnd, pickerUntil]);
 
   // Put the cursor in the title. Not on touch devices: there the on-screen
   // keyboard would pop up and cover half the screen before the user asks.
@@ -62,12 +68,55 @@ export default function EventEditor({
   // The form shows the times in the event's time zone ('' = the primary one).
   const zone = draft.timeZone && draft.timeZone !== tz ? draft.timeZone : '';
   const etz = zone || tz;
-  const ws = T.toWall(draft.start, etz);
-  const we = T.toWall(draft.end, etz);
+  // All-day events keep wall dates (no time zone conversion).
+  const ws = draft.allDay ? draft.start : T.toWall(draft.start, etz);
+  const we = draft.allDay ? draft.end : T.toWall(draft.end, etz);
   const day = T.startOfDay(ws);
   const tf = settings.timeFormat;
 
-  const setWall = (newWs: number, newWe: number) => onChange({ start: T.fromWall(newWs, etz), end: T.fromWall(newWe, etz) });
+  const setWall = (newWs: number, newWe: number) => {
+    if (draft.allDay) {
+      const start = T.startOfDay(newWs);
+      onChange({ start, end: Math.max(T.startOfDay(newWe), T.addDays(start, 1)) });
+    } else {
+      onChange({ start: T.fromWall(newWs, etz), end: T.fromWall(newWe, etz) });
+    }
+  };
+
+  const toggleAllDay = (allDay: boolean) => {
+    if (allDay) {
+      const start = T.startOfDay(ws);
+      onChange({ allDay: true, timeZone: '', start, end: Math.max(T.addDays(start, 1), T.startOfDay(we)) });
+    } else {
+      // Back to a timed event: 9am on the first day, with the default length.
+      const start = T.fromWall(T.startOfDay(ws) + 9 * T.HOUR, tz);
+      onChange({ allDay: false, timeZone: '', start, end: start + settings.defaultDuration * T.MINUTE });
+    }
+  };
+
+  // ---- Repeating ----
+  const repeat = draft.repeat || '';
+  const weekday = new Date(ws).getUTCDay();
+  const weekdays = draft.repeatWeekdays || [];
+  const setRepeat = (value: Repeat) => {
+    onChange({
+      repeat: value,
+      repeatInterval: draft.repeatInterval || 1,
+      repeatWeekdays: value === 'weekly' && weekdays.length === 0 ? [weekday] : weekdays,
+      repeatUntil: value ? draft.repeatUntil ?? null : null,
+    });
+  };
+  const repeatUnit =
+    repeat === 'daily' ? 'day' : repeat === 'weekly' ? 'week' : repeat === 'monthly' ? 'month' : 'year';
+  const unitLabel = (n: number) => `${repeatUnit}${n === 1 ? '' : 's'}`;
+  const untilWall = draft.repeatUntil
+    ? draft.allDay
+      ? draft.repeatUntil
+      : T.toWall(draft.repeatUntil, etz)
+    : null;
+  // The last occurrence can start any time that day.
+  const endOfDay = (d: number) =>
+    draft.allDay ? T.addDays(T.startOfDay(d), 1) - 1 : T.fromWall(T.addDays(T.startOfDay(d), 1) - 1, etz);
 
   // Time zone choices: the primary one and the "Other time zones" from
   // settings (plus the event's own, if it was removed from settings since).
@@ -142,46 +191,101 @@ export default function EventEditor({
       <div className="editor-row">
         <Icon name="schedule" className="row-icon" size={20} />
         <div className="editor-when">
-          <div className="date-field">
-            <button type="button" className="field-btn" ref={dateBtnRef} onClick={() => setPicker(!picker)} aria-label="Date">
-              {T.weekdayName(ws)}, {T.formatDate(ws, settings.dateFormat)}
-            </button>
-            {picker && (
-              <DatePicker anchorRef={dateBtnRef}>
-                <MiniMonth
-                  value={day}
-                  today={today}
-                  onPick={(d) => {
-                    setPicker(false);
-                    setWall(d + (ws - day), d + (we - day));
-                  }}
+          {draft.allDay ? (
+            <div className="allday-dates">
+              <div className="date-field">
+                <button type="button" className="field-btn" ref={dateBtnRef} onClick={() => setPicker(!picker)} aria-label="Start date">
+                  {T.weekdayShort(ws)}, {T.formatDate(ws, settings.dateFormat)}
+                </button>
+                {picker && (
+                  <DatePicker anchorRef={dateBtnRef}>
+                    <MiniMonth
+                      value={day}
+                      today={today}
+                      weekStart={settings.weekStart}
+                      onPick={(d) => {
+                        setPicker(false);
+                        setWall(d + (ws - day), d + (we - day));
+                      }}
+                    />
+                  </DatePicker>
+                )}
+              </div>
+              <span>–</span>
+              <div className="date-field">
+                <button
+                  type="button"
+                  className="field-btn"
+                  ref={endBtnRef}
+                  onClick={() => setPickerEnd(!pickerEnd)}
+                  aria-label="End date"
+                >
+                  {T.weekdayShort(T.allDayEnd(we))}, {T.formatDate(T.allDayEnd(we), settings.dateFormat)}
+                </button>
+                {pickerEnd && (
+                  <DatePicker anchorRef={endBtnRef}>
+                    <MiniMonth
+                      value={T.allDayEnd(we)}
+                      today={today}
+                      weekStart={settings.weekStart}
+                      onPick={(d) => {
+                        setPickerEnd(false);
+                        onChange({ end: Math.max(T.addDays(T.startOfDay(d), 1), T.addDays(T.startOfDay(ws), 1)) });
+                      }}
+                    />
+                  </DatePicker>
+                )}
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="date-field">
+                <button type="button" className="field-btn" ref={dateBtnRef} onClick={() => setPicker(!picker)} aria-label="Date">
+                  {T.weekdayName(ws)}, {T.formatDate(ws, settings.dateFormat)}
+                </button>
+                {picker && (
+                  <DatePicker anchorRef={dateBtnRef}>
+                    <MiniMonth
+                      value={day}
+                      today={today}
+                      weekStart={settings.weekStart}
+                      onPick={(d) => {
+                        setPicker(false);
+                        setWall(d + (ws - day), d + (we - day));
+                      }}
+                    />
+                  </DatePicker>
+                )}
+              </div>
+              <div className="time-fields">
+                <TimeInput
+                  aria-label="Start time"
+                  value={ws}
+                  options={startList}
+                  resolve={resolveStart}
+                  format={fmt}
+                  onChange={(s) => setWall(s, s + (we - ws))}
                 />
-              </DatePicker>
-            )}
-          </div>
-          <div className="time-fields">
-            <TimeInput
-              aria-label="Start time"
-              value={ws}
-              options={startList}
-              resolve={resolveStart}
-              format={fmt}
-              onChange={(s) => setWall(s, s + (we - ws))}
-            />
-            <span>–</span>
-            <TimeInput
-              aria-label="End time"
-              value={we}
-              options={endList}
-              resolve={resolveEnd}
-              format={fmt}
-              onChange={(e) => setWall(ws, e)}
-            />
-          </div>
+                <span>–</span>
+                <TimeInput
+                  aria-label="End time"
+                  value={we}
+                  options={endList}
+                  resolve={resolveEnd}
+                  format={fmt}
+                  onChange={(e) => setWall(ws, e)}
+                />
+              </div>
+            </>
+          )}
+          <label className="checkbox all-day-toggle">
+            <input type="checkbox" checked={draft.allDay} onChange={(e) => toggleAllDay(e.target.checked)} />
+            <span>All day</span>
+          </label>
         </div>
       </div>
 
-      {zoneOptions.length > 1 && (
+      {!draft.allDay && zoneOptions.length > 1 && (
         <div className="editor-row">
           <Icon name="public" className="row-icon" size={20} />
           <div className="editor-calendar">
@@ -189,6 +293,107 @@ export default function EventEditor({
           </div>
         </div>
       )}
+
+      <div className="editor-row">
+        <Icon name="repeat" className="row-icon" size={20} />
+        <div className="editor-repeat">
+          <Select
+            aria-label="Repeat"
+            value={repeat}
+            options={[
+              { value: '', label: 'Does not repeat' },
+              { value: 'daily', label: 'Daily' },
+              { value: 'weekly', label: 'Weekly' },
+              { value: 'monthly', label: 'Monthly' },
+              { value: 'yearly', label: 'Yearly' },
+            ]}
+            onChange={(v) => setRepeat(v as Repeat)}
+          />
+          {repeat && (
+            <div className="repeat-options">
+              <label className="repeat-every">
+                <span>Every</span>
+                <input
+                  className="repeat-number"
+                  type="number"
+                  min={1}
+                  max={99}
+                  aria-label="Repeat interval"
+                  value={draft.repeatInterval || 1}
+                  onChange={(e) =>
+                    onChange({ repeatInterval: Math.max(1, Math.min(99, Number(e.target.value) || 1)) })
+                  }
+                />
+                <span>{unitLabel(draft.repeatInterval || 1)}</span>
+              </label>
+              {repeat === 'weekly' && (
+                <div className="repeat-days" role="group" aria-label="Repeat on">
+                  {Array.from({ length: 7 }, (_, i) => (settings.weekStart + i) % 7).map((d) => {
+                    const on = weekdays.includes(d);
+                    return (
+                      <button
+                        key={d}
+                        type="button"
+                        className={`repeat-day ${on ? 'on' : ''}`}
+                        aria-pressed={on}
+                        aria-label={T.WEEKDAYS[d]}
+                        onClick={() => {
+                          const next = on ? weekdays.filter((x) => x !== d) : [...weekdays, d].sort((a, b) => a - b);
+                          onChange({ repeatWeekdays: next.length ? next : [d] });
+                        }}
+                      >
+                        {T.WEEKDAYS[d].slice(0, 2)}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="repeat-end">
+                <span>Ends</span>
+                <Select
+                  aria-label="Repeat end"
+                  value={draft.repeatUntil ? 'on' : 'never'}
+                  options={[
+                    { value: 'never', label: 'Never' },
+                    { value: 'on', label: 'On a date' },
+                  ]}
+                  onChange={(v) =>
+                    onChange({
+                      repeatUntil: v === 'never' ? null : endOfDay(T.addMonths(T.startOfDay(ws), 1)),
+                    })
+                  }
+                />
+                {draft.repeatUntil && untilWall !== null && (
+                  <div className="date-field">
+                    <button
+                      type="button"
+                      className="field-btn"
+                      ref={untilBtnRef}
+                      onClick={() => setPickerUntil(!pickerUntil)}
+                      aria-label="Repeat end date"
+                    >
+                      {T.formatDate(untilWall, settings.dateFormat)}
+                    </button>
+                    {pickerUntil && (
+                      <DatePicker anchorRef={untilBtnRef}>
+                        <MiniMonth
+                          value={T.startOfDay(untilWall)}
+                          today={today}
+                          weekStart={settings.weekStart}
+                          onPick={(d) => {
+                            setPickerUntil(false);
+                            onChange({ repeatUntil: endOfDay(d) });
+                          }}
+                        />
+                      </DatePicker>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
 
       <div className="editor-row">
         <Icon name="notes" className="row-icon" size={20} />

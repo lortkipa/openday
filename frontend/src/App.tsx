@@ -8,7 +8,9 @@ import Sidebar from './components/Sidebar';
 import TimeGrid from './components/TimeGrid';
 import MonthView from './components/MonthView';
 import YearView from './components/YearView';
+import AgendaView from './components/AgendaView';
 import EventEditor from './components/EventEditor';
+import DeleteRepeatDialog from './components/DeleteRepeatDialog';
 import EventDetails from './components/EventDetails';
 import ContextMenu from './components/ContextMenu';
 import CalendarMenu from './components/CalendarMenu';
@@ -52,9 +54,13 @@ const DEFAULT_SETTINGS: Settings = {
   animations: true,
   keyboardShortcuts: true,
   otherTimeZones: [],
+  weekStart: 0,
+  defaultView: 'week',
+  snapMinutes: 15,
+  defaultCalendarId: 0,
 };
 
-const VIEWS: View[] = ['day', 'week', 'month', 'year'];
+const VIEWS: View[] = ['day', 'week', 'month', 'year', 'agenda'];
 
 // Small per-browser preferences (current view, sidebar open).
 function useLocalState<V>(key: string, initial: V) {
@@ -110,8 +116,18 @@ export default function App() {
   const nowWall = T.toWall(now, tz);
   const today = T.startOfDay(nowWall);
 
-  const [view, setViewRaw] = useLocalState<View>('openday.view', 'week');
-  const setView = (v: View) => VIEWS.includes(v) && setViewRaw(v);
+  // The view is a setting (last used), so it follows the user across devices.
+  const [view, setViewState] = useState<View>('week');
+  const viewChosen = useRef(false);
+  useEffect(() => {
+    if (!viewChosen.current) setViewState(settings.defaultView);
+  }, [settings.defaultView]);
+  const setView = (v: View) => {
+    if (!VIEWS.includes(v)) return;
+    viewChosen.current = true;
+    setViewState(v);
+    if (settings.defaultView !== v) updateSettings({ defaultView: v });
+  };
   const [cursor, setCursor] = useState(() => T.startOfDay(T.toWall(Date.now(), T.browserTimeZone())));
   const narrow = useMedia(NARROW);
   const phone = useMedia(PHONE);
@@ -141,8 +157,10 @@ export default function App() {
   const [eventsVersion, setEventsVersion] = useState(0); // goes up when events changed elsewhere
   const [draft, setDraft] = useState<Draft | null>(null); // event being created (no id) or edited
   const [editorAnchor, setEditorAnchor] = useState<Anchor | null>(null);
-  const [details, setDetails] = useState<{ id: number; anchor: Anchor } | null>(null);
-  const [menu, setMenu] = useState<{ id: number; x: number; y: number } | null>(null);
+  // Occurrences of a repeating event share an id, so the card remembers the occurrence.
+  const [details, setDetails] = useState<{ id: number; occurrence?: number; anchor: Anchor } | null>(null);
+  const [menu, setMenu] = useState<{ id: number; occurrence?: number; x: number; y: number } | null>(null);
+  const [deleteAsk, setDeleteAsk] = useState<CalendarEvent | null>(null);
   const [calMenu, setCalMenu] = useState<{ id: number; x: number; y: number } | null>(null); // options of a calendar
   const [appearanceOpen, setAppearanceOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -255,7 +273,15 @@ export default function App() {
   };
 
   // Deletes the calendar and all of its events (the server does the same).
+  // A backup is taken first, so Undo can put the calendar and its events back.
   const deleteCalendar = async (id: number) => {
+    let backup: unknown;
+    try {
+      backup = await api.exportBackup(id);
+    } catch (err) {
+      showError(err);
+      return false;
+    }
     try {
       await api.deleteCalendar(id);
     } catch (err) {
@@ -268,8 +294,30 @@ export default function App() {
     setDetails(null);
     setMenu(null);
     setCalMenu(null);
-    setSnack({ text: 'Calendar deleted' });
+    setSnack({
+      text: 'Calendar deleted',
+      action: 'Undo',
+      onAction: async () => {
+        try {
+          const res = await api.restoreBackup(backup);
+          await loadCalendars();
+          setEventsVersion((v) => v + 1);
+          setSnack({ text: res.calendars === 1 ? 'Calendar restored' : `${res.calendars} calendars restored` });
+        } catch (err) {
+          showError(err);
+        }
+      },
+    });
     return true;
+  };
+
+  // Restore a backup file chosen in Settings. It only adds data.
+  const restoreBackup = async (data: unknown) => {
+    const res = await api.restoreBackup(data);
+    await loadCalendars();
+    setEventsVersion((v) => v + 1);
+    setSnack({ text: `Restored ${res.calendars} calendar(s) and ${res.events} event(s)` });
+    return res;
   };
 
   // When the time zone changes, keep showing the same calendar day.
@@ -286,22 +334,23 @@ export default function App() {
     const day = T.startOfDay(cursor);
     if (view === 'day') return [day, T.addDays(day, 1)];
     if (view === 'week') {
-      const s = T.startOfWeek(cursor);
+      const s = T.startOfWeek(cursor, settings.weekStart);
       return [s, T.addDays(s, 7)];
     }
     if (view === 'month') {
-      const days = T.monthGridDays(cursor);
+      const days = T.monthGridDays(cursor, settings.weekStart);
       return [days[0], T.addDays(days[days.length - 1], 1)];
     }
+    if (view === 'agenda') return [day, T.addDays(day, 30)];
     return null;
-  }, [view, cursor]);
+  }, [view, cursor, settings.weekStart]);
 
   const rangeKey = range ? `${range[0]}-${range[1]}-${tz}` : 'none';
   useEffect(() => {
     if (!range) return undefined;
     let cancelled = false;
     api
-      .listEvents(T.fromWall(range[0], tz), T.fromWall(range[1], tz))
+      .listEvents(T.fromWall(range[0], tz), T.fromWall(range[1], tz), tz)
       .then((list) => !cancelled && setEvents(list), (err) => !cancelled && showError(err));
     return () => {
       cancelled = true;
@@ -316,8 +365,10 @@ export default function App() {
     let list: (Omit<CalendarEvent, 'id'> & { id: ShownEvent['id']; zoneSet?: boolean })[] = events;
     if (draft) {
       const d = draft;
+      // While editing, the draft stands in for the whole series (occurrences
+      // share an id, so they are all taken out and one draft is shown).
       list = d.id
-        ? events.map((e) => (e.id === d.id ? { ...d, id: e.id } : e))
+        ? [...events.filter((e) => e.id !== d.id), { ...d, id: d.id }]
         : [...events, { ...d, id: 'draft' as const }];
     }
     return list
@@ -326,8 +377,10 @@ export default function App() {
         ...e,
         color: colorOf(e, calById[e.calendarId]),
         isDraft: e.id === 'draft',
-        ws: T.toWall(e.start, tz),
-        we: T.toWall(e.end, tz),
+        // All-day events are calendar dates, not instants: they need no
+        // time zone conversion.
+        ws: e.allDay ? e.start : T.toWall(e.start, tz),
+        we: e.allDay ? e.end : T.toWall(e.end, tz),
       }));
   }, [events, draft, tz, calById]);
   // Color of an event that is being drawn with the mouse (before the form opens).
@@ -338,6 +391,7 @@ export default function App() {
     if (view === 'day') setCursor((c) => T.addDays(c, dir));
     else if (view === 'week') setCursor((c) => T.addDays(c, 7 * dir));
     else if (view === 'month') setCursor((c) => T.addMonths(c, dir));
+    else if (view === 'agenda') setCursor((c) => T.addDays(c, 30 * dir));
     else setCursor((c) => T.addMonths(c, 12 * dir));
   };
   const openDay = (day: number) => {
@@ -367,6 +421,10 @@ export default function App() {
   };
 
   // ---- Create / edit ----
+  // New events go to the default calendar from Settings (or the primary one).
+  const defaultCal = () =>
+    (settings.defaultCalendarId ? calById[settings.defaultCalendarId] : undefined) || primaryCal;
+
   const startDraft = (wallStart: number, wallEnd: number, anchor: Anchor | null) => {
     closePopups();
     const start = T.fromWall(wallStart, tz);
@@ -375,17 +433,44 @@ export default function App() {
       d && !d.id
         ? { ...d, start, end }
         : {
-            calendarId: primaryCal?.id || 0,
-            timeZone: calendarZone(primaryCal, tz), // the calendar's time zone
+            calendarId: defaultCal()?.id || 0,
+            timeZone: calendarZone(defaultCal(), tz), // the calendar's time zone
             title: '',
             description: '',
             color: '', // calendar color
             start,
             end,
             reminders: settings.defaultReminder >= 0 ? [settings.defaultReminder] : [],
+            allDay: false,
+            repeat: '',
+            repeatInterval: 1,
+            repeatWeekdays: [],
+            repeatUntil: null,
           },
     );
     setEditorAnchor(anchor || null);
+  };
+
+  // Clicking the all-day row creates a one-day all-day event (dates can be
+  // changed in the form).
+  const startAllDay = (day: number, anchor: Anchor | null) => {
+    closePopups();
+    setDraft({
+      calendarId: defaultCal()?.id || 0,
+      timeZone: '',
+      title: '',
+      description: '',
+      color: '',
+      start: T.startOfDay(day),
+      end: T.addDays(T.startOfDay(day), 1),
+      reminders: settings.defaultReminder >= 0 ? [settings.defaultReminder] : [],
+      allDay: true,
+      repeat: '',
+      repeatInterval: 1,
+      repeatWeekdays: [],
+      repeatUntil: null,
+    });
+    setEditorAnchor(anchor);
   };
 
   // Swipe left/right on the calendar to go to the next/previous period (phones).
@@ -424,12 +509,35 @@ export default function App() {
     startDraft(start, start + settings.defaultDuration * T.MINUTE, null);
   };
 
-  const editEvent = (id: number, anchor: Anchor | null) => {
-    const ev = events.find((e) => e.id === id);
+  const editEvent = (id: number, occurrence: number | undefined, anchor: Anchor | null) => {
+    const ev = events.find((e) => e.id === id && (e.occurrence ?? 0) === (occurrence ?? 0));
     if (!ev) return;
     closePopups();
-    setDraft({ ...ev });
+    // Editing an occurrence edits the whole series: show its first occurrence.
+    setDraft({
+      ...ev,
+      start: ev.seriesStart ?? ev.start,
+      end: ev.seriesEnd ?? ev.end,
+      occurrence: undefined,
+      seriesStart: undefined,
+      seriesEnd: undefined,
+    });
     setEditorAnchor(anchor || null);
+  };
+
+  // A copy of the event (same fields, new event).
+  const duplicateEvent = (ev: CalendarEvent) => {
+    closePopups();
+    setDraft({
+      ...ev,
+      id: undefined,
+      occurrence: undefined,
+      seriesStart: undefined,
+      seriesEnd: undefined,
+      start: ev.seriesStart ?? ev.start,
+      end: ev.seriesEnd ?? ev.end,
+    });
+    setEditorAnchor(null);
   };
 
   const saveDraft = async () => {
@@ -438,7 +546,12 @@ export default function App() {
     setDraft(null);
     try {
       const saved = d.id ? await api.updateEvent(d) : await api.createEvent(d);
-      setEvents((list) => (d.id ? list.map((e) => (e.id === saved.id ? saved : e)) : [...list, saved]));
+      if (saved.repeat || d.repeat) {
+        // The saved event expands into several occurrences: load them again.
+        setEventsVersion((v) => v + 1);
+      } else {
+        setEvents((list) => (d.id ? list.map((e) => (e.id === saved.id ? saved : e)) : [...list, saved]));
+      }
       // Saved into a hidden calendar: show that calendar, so the event does not vanish.
       if (calById[saved.calendarId]?.hidden) updateCalendar(saved.calendarId, { hidden: false });
       setSnack({ text: 'Event saved' });
@@ -448,14 +561,22 @@ export default function App() {
     }
   };
 
-  const deleteEvent = async (id: number) => {
-    const ev = events.find((e) => e.id === id);
+  // Delete one occurrence ('this') or the whole series ('all').
+  const deleteEvent = async (ev: CalendarEvent, mode: 'this' | 'all' = 'all') => {
     closePopups();
-    if (draft && draft.id === id) setDraft(null);
-    if (!ev) return;
-    setEvents((list) => list.filter((e) => e.id !== id));
+    if (draft && draft.id === ev.id) setDraft(null);
+    const occurrence = mode === 'this' ? ev.occurrence ?? ev.start : undefined;
+    const same = (e: CalendarEvent) =>
+      e.id === ev.id && (mode === 'all' || (e.occurrence ?? 0) === (ev.occurrence ?? 0));
+    setEvents((list) => list.filter((e) => !same(e)));
     try {
-      await api.deleteEvent(id);
+      await api.deleteEvent(ev.id, occurrence);
+      if (ev.repeat) {
+        // Occurrences are made by the server: load the remaining ones again.
+        setEventsVersion((v) => v + 1);
+        setSnack({ text: mode === 'this' ? 'Event deleted' : 'Repeating events deleted' });
+        return;
+      }
       setSnack({
         text: 'Event deleted',
         action: 'Undo',
@@ -469,9 +590,15 @@ export default function App() {
         },
       });
     } catch (err) {
-      setEvents((list) => [...list, ev]);
+      setEventsVersion((v) => v + 1);
       showError(err);
     }
+  };
+
+  // A repeating event asks before deleting: one occurrence or the series?
+  const askDelete = (ev: CalendarEvent) => {
+    if (ev.repeat) setDeleteAsk(ev);
+    else void deleteEvent(ev);
   };
 
   // Save a change to a saved event right away (drag, resize, color).
@@ -479,21 +606,32 @@ export default function App() {
     const ev = events.find((e) => e.id === id);
     if (!ev) return;
     const next = { ...ev, ...patch };
-    setEvents((list) => list.map((e) => (e.id === id ? next : e)));
+    if (!ev.repeat) setEvents((list) => list.map((e) => (e.id === id ? next : e)));
     if (draft && draft.id === id) setDraft((d) => d && { ...d, ...patch });
     try {
       const saved = await api.updateEvent(next);
-      setEvents((list) => list.map((e) => (e.id === id ? saved : e)));
+      if (ev.repeat) setEventsVersion((v) => v + 1);
+      else setEvents((list) => list.map((e) => (e.id === id ? saved : e)));
     } catch (err) {
-      setEvents((list) => list.map((e) => (e.id === id ? ev : e)));
+      if (ev.repeat) setEventsVersion((v) => v + 1);
+      else setEvents((list) => list.map((e) => (e.id === id ? ev : e)));
       showError(err);
     }
   };
 
   const onEventTimeChange = (ev: ShownEvent, wallStart: number, wallEnd: number) => {
+    if (ev.allDay) return; // all-day bars are changed in the form
     const patch = { start: T.fromWall(wallStart, tz), end: T.fromWall(wallEnd, tz) };
     if (ev.isDraft || (draft && draft.id === ev.id)) setDraft((d) => d && { ...d, ...patch });
-    else if (typeof ev.id === 'number') patchEvent(ev.id, patch);
+    else if (typeof ev.id === 'number') {
+      if (ev.repeat && ev.seriesStart !== undefined && ev.seriesEnd !== undefined) {
+        // Moving an occurrence moves the whole series by the same amount.
+        patchEvent(ev.id, {
+          start: ev.seriesStart + (patch.start - ev.start),
+          end: ev.seriesEnd + (patch.end - ev.end),
+        });
+      } else patchEvent(ev.id, patch);
+    }
   };
 
   const onEventClick = (ev: ShownEvent, anchor: Anchor) => {
@@ -501,13 +639,13 @@ export default function App() {
     if (draft && !docked) setDraft(null);
     if (draft && docked && draft.id === ev.id) return;
     setMenu(null);
-    setDetails({ id: ev.id, anchor });
+    setDetails({ id: ev.id, occurrence: ev.occurrence, anchor });
   };
 
   const onEventContext = (ev: ShownEvent, x: number, y: number) => {
     if (ev.isDraft || typeof ev.id !== 'number') return;
     setDetails(null);
-    setMenu({ id: ev.id, x, y });
+    setMenu({ id: ev.id, occurrence: ev.occurrence, x, y });
   };
 
   // ---- Keyboard shortcuts (like the classic calendar ones) ----
@@ -539,6 +677,7 @@ export default function App() {
     else if (k === 'w') setView('week');
     else if (k === 'm') setView('month');
     else if (k === 'y') setView('year');
+    else if (k === 'a') setView('agenda');
     else if (k === 't') setCursor(today);
     else if (k === 'j' || k === 'n') go(1);
     else if (k === 'k' || k === 'p') go(-1);
@@ -555,11 +694,13 @@ export default function App() {
   // ---- Things that animate when they open and close (see motion.js) ----
   // They stay on the page for a moment after closing, showing what they
   // showed last. Hooks must run before the early return below.
-  const detailsEvent = details && events.find((e) => e.id === details.id);
+  const detailsEvent =
+    details && events.find((e) => e.id === details.id && (e.occurrence ?? 0) === (details.occurrence ?? 0));
   const detailsExit = useExit(details && detailsEvent ? { event: detailsEvent, anchor: details.anchor } : null);
   const appearanceExit = useExit(appearanceOpen);
   const shortcutsExit = useExit(shortcutsOpen);
-  const menuEvent = menu && events.find((e) => e.id === menu.id);
+  const deleteAskExit = useExit(deleteAsk);
+  const menuEvent = menu && events.find((e) => e.id === menu.id && (e.occurrence ?? 0) === (menu.occurrence ?? 0));
   const menuExit = useExit(menu && menuEvent ? { event: menuEvent, x: menu.x, y: menu.y } : null);
   const calMenuCalendar = calMenu && calById[calMenu.id];
   const calMenuExit = useExit(
@@ -589,6 +730,7 @@ export default function App() {
           onCreateCalendar={createCalendar}
           onUpdateCalendar={updateCalendar}
           onDeleteCalendar={deleteCalendar}
+          onRestore={restoreBackup}
           showShortcuts={showShortcuts}
           onViewShortcuts={() => {
             setPage('calendar');
@@ -640,6 +782,7 @@ export default function App() {
         tzName={tz}
         extraZones={extraZones}
         onCreate={startDraft}
+        onCreateAllDay={startAllDay}
         onEventTimeChange={onEventTimeChange}
         onInteract={closePopups}
       />
@@ -655,8 +798,12 @@ export default function App() {
         }}
       />
     );
+  } else if (view === 'agenda' && range) {
+    main = <AgendaView {...common} from={range[0]} days={30} calendars={calendars} />;
   } else {
-    main = <YearView cursor={cursor} today={today} onDayClick={openDay} />;
+    main = (
+      <YearView cursor={cursor} today={today} onDayClick={openDay} weekStart={settings.weekStart} />
+    );
   }
 
   // A closing form shows the last draft and ignores the user.
@@ -678,7 +825,16 @@ export default function App() {
         onChange={closing ? noop : (patch) => setDraft((d) => d && { ...d, ...patch })}
         onSave={closing ? noop : saveDraft}
         onClose={closing ? noop : () => setDraft(null)}
-        onDelete={shown.id && !closing ? () => deleteEvent(shown.id!) : null}
+        onDelete={
+          shown.id && !closing
+            ? () => {
+                const ev = events.find((e) => e.id === shown.id);
+                // The form edits the series; the details card and menu offer
+                // "this event" for one occurrence.
+                if (ev) void deleteEvent(ev, 'all');
+              }
+            : null
+        }
         sheet={phone}
         onToggleDock={phone || closing ? null : () => setDocked(!docked)}
       />
@@ -689,6 +845,9 @@ export default function App() {
 
   return (
     <div className="app">
+      <a className="skip-link" href="#main">
+        Skip to calendar
+      </a>
       <Header
         view={view}
         cursor={cursor}
@@ -701,6 +860,7 @@ export default function App() {
         onOpenAppearance={() => setAppearanceOpen(true)}
         onOpenShortcuts={showShortcuts ? () => setShortcutsOpen(true) : null}
         shortcuts={showShortcuts && settings.keyboardShortcuts}
+        weekStart={settings.weekStart}
       />
       <div className="app-body">
         {/* Docked form takes the sidebar's place on the left, like the classic calendar. */}
@@ -736,6 +896,7 @@ export default function App() {
                 },
               }}
               shortcuts={showShortcuts && settings.keyboardShortcuts}
+              weekStart={settings.weekStart}
               onPick={(d) => {
                 setCursor(d);
                 if (narrow) setPhoneSidebar(false);
@@ -743,7 +904,7 @@ export default function App() {
             />
           </>
         )}
-        <main className="main" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+        <main id="main" tabIndex={-1} className="main" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
           {main}
         </main>
       </div>
@@ -759,8 +920,9 @@ export default function App() {
           anchor={detailsShown.anchor}
           closing={detailsExit.phase === 'exit'}
           onClose={() => setDetails(null)}
-          onEdit={() => editEvent(detailsShown.event.id, detailsShown.anchor)}
-          onDelete={() => deleteEvent(detailsShown.event.id)}
+          onEdit={() => editEvent(detailsShown.event.id, detailsShown.event.occurrence, detailsShown.anchor)}
+          onDelete={() => askDelete(detailsShown.event)}
+          onDuplicate={() => duplicateEvent(detailsShown.event)}
         />
       )}
       {menuShown && (
@@ -777,9 +939,14 @@ export default function App() {
             patchEvent(menuShown.event.id, { color });
           }}
           onEdit={() =>
-            editEvent(menuShown.event.id, { left: menuShown.x, right: menuShown.x, top: menuShown.y })
+            editEvent(menuShown.event.id, menuShown.event.occurrence, {
+              left: menuShown.x,
+              right: menuShown.x,
+              top: menuShown.y,
+            })
           }
-          onDelete={() => deleteEvent(menuShown.event.id)}
+          onDelete={() => askDelete(menuShown.event)}
+          onDuplicate={() => duplicateEvent(menuShown.event)}
         />
       )}
       {calMenuShown && (
@@ -817,6 +984,24 @@ export default function App() {
           closing={shortcutsExit.phase === 'exit'}
           onEnable={() => updateSettings({ keyboardShortcuts: true })}
           onClose={() => setShortcutsOpen(false)}
+        />
+      )}
+      {deleteAskExit.shown && (
+        <DeleteRepeatDialog
+          key={`delete-${deleteAskExit.key}`}
+          title={deleteAskExit.shown.title}
+          closing={deleteAskExit.phase === 'exit'}
+          onCancel={() => setDeleteAsk(null)}
+          onThis={() => {
+            const ev = deleteAskExit.shown!;
+            setDeleteAsk(null);
+            void deleteEvent(ev, 'this');
+          }}
+          onAll={() => {
+            const ev = deleteAskExit.shown!;
+            setDeleteAsk(null);
+            void deleteEvent(ev, 'all');
+          }}
         />
       )}
       {snackBar}

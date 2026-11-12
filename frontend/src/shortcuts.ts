@@ -21,6 +21,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: ['W'], label: 'Week' },
       { keys: ['M'], label: 'Month' },
       { keys: ['Y'], label: 'Year' },
+      { keys: ['A'], label: 'Schedule' },
     ],
   },
   {

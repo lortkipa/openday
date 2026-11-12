@@ -15,6 +15,8 @@ When making product or UI decisions, the default answer is: **do what Google Cal
 
 First working version: day/week/month/year views, events (create, edit, move, resize, color, delete), several calendars, notifications, settings, light/dark theme, live sync between all open apps, desktop app (Electron).
 
+Also: all-day and multi-day events, repeating events (with "this event / all events" delete), Schedule (agenda) view, duplicate event, undo deleting a calendar, JSON backup/restore and iCalendar export, installable PWA with an offline shell, security headers, accessibility pass (skip link, focus trapping, keyboard access to events).
+
 Commands:
 
 | What | Command |
@@ -59,7 +61,7 @@ Smaller decisions (made in the first version; change them only after asking the 
 
 How the app works:
 
-- API lives under `/api` (`backend/api.go`): `GET/POST /api/events`, `PUT/DELETE /api/events/{id}`, `GET/POST /api/calendars`, `PUT/DELETE /api/calendars/{id}`, `GET/PUT /api/settings`, `GET /api/health`, `GET /api/stream`.
+- API lives under `/api` (`backend/api.go`): `GET/POST /api/events`, `PUT/DELETE /api/events/{id}` (add `?occurrence=<RFC3339 start>` to `DELETE` to remove one occurrence of a repeating event), `GET/POST /api/calendars`, `PUT/DELETE /api/calendars/{id}`, `GET/PUT /api/settings`, `GET /api/export[?calendar=<id>]`, `GET /api/export.ics`, `POST /api/import`, `GET /api/health`, `GET /api/stream`.
 - Live sync (`backend/live.go`, `frontend/src/live.ts`):
   - Every open app keeps one Server-Sent Events stream (`GET /api/stream`). After each successful change the server sends `{"topic": "events" | "calendars" | "settings", "client": "..."}`. Deleting a calendar sends `calendars` and `events`.
   - New write routes must be wrapped with `h.notify(handler, topics...)` in `Register`, or other apps will not see the change.
@@ -84,13 +86,21 @@ How the app works:
   - Saving an event into a hidden calendar shows that calendar again.
   - Hidden calendars still send notifications (like the classic calendar).
 - Events are stored as UTC Unix milliseconds. The frontend shows them in the time zone from settings.
+- All-day events (`all_day` = 1, `backend/store.go`): `start_ms` and `end_ms` are UTC midnights, and `end_ms` is exclusive (a one-day event ends at the next midnight). They have no time zone. `POST`/`PUT` reject times that are not midnight. In the day and week views they get their own row above the hours; in the month view they are chips in the day cell. The form swaps the time fields for start and end dates.
+- Repeating events (`backend/recurrence.go`): columns `repeat_rule` (`daily`, `weekly`, `monthly`, `yearly` or `''`), `repeat_interval` (1 or more), `repeat_until` (Unix ms, `0` = never) and `repeat_weekdays` (JSON array of 0 to 6, Sunday is 0; weekly only). No RRULE strings.
+  - `GET /api/events` expands the series for the requested range on the server. `tz` says which zone to expand in (missing = server local time); the client always sends the primary time zone.
+  - Occurrences keep the event's wall-clock time in its own zone across DST. Invalid dates are skipped (Feb 31, Feb 29 in a normal year). Expansion is capped, so a daily "never ends" series cannot flood a year view.
+  - Occurrences carry the series `id` plus `occurrence` (the start of this occurrence) and `seriesStart`/`seriesEnd`. The form edits the whole series; moving an occurrence moves the series.
+  - Deleting one occurrence writes its start to `event_exceptions` and leaves the series alone. Deleting the series removes the event and its exceptions.
+- Backup and restore (`backend/export.go`): `GET /api/export` writes one JSON object with `version`, `settings`, `calendars` and `events` (repeating events keep their columns; deleted occurrences are not included). `?calendar=<id>` limits it to one calendar, which is what undo uses. `POST /api/import` only adds data; it never deletes or overwrites. `GET /api/export.ics` writes one `VEVENT` per event, with `RRULE` for repeating events.
+- Deleting a calendar first fetches its backup. The snackbar offers Undo, which imports that backup again (the calendar and its events come back with new ids).
 - Time zones:
   - Settings → Time zone: "Primary time zone" (`timeZone`, '' = device) and "Other time zones" (`otherTimeZones`, up to 5 IANA names, stored as a JSON array in the settings table).
   - Day/week grid: each other time zone gets its own hour column left of the primary one (`extraZones` in `App.tsx`, `.tg-gutter.extra`). Not on phones (no room).
   - Each event has `timeZone` (`time_zone` column; '' = the primary time zone). The event form shows its times in that zone. The form's time zone drop-down offers only the primary zone and the other time zones from settings (plus the event's own if it was removed from settings), and is hidden when there is no other choice. Changing it keeps the clock times (9am stays 9am, in the new zone), like the classic calendar.
   - A new event takes the time zone of its calendar (`calendarZone` in `frontend/src/calendars.ts`). The moment stays the same (the clicked slot); the form shows it in that zone. Changing the calendar of a new event also changes the zone, until the user picks a time zone by hand (`zoneSet` on the draft, not saved).
   - The grid always draws events in the primary time zone. The details card adds a line with the time in the event's zone when it differs.
-- Settings (date format, time format, time zone, default duration, default notification, notification settings, theme, animations, keyboard shortcuts) are stored in the database, so they follow the user across browsers.
+- Settings (date format, time format, time zone, default duration, default notification, notification settings, theme, animations, keyboard shortcuts, week start, default view, drag step `snapMinutes`, default calendar) are stored in the database, so they follow the user across browsers. The week start is used by the week, month and mini-month grids (`startOfWeek`, `monthGridDays` in `time.ts`). The default view is what the app opens with, and it is also saved as the last view used. The drag step is 5, 10, 15, 30 or 60 minutes.
 - Notifications (`frontend/src/notifications.ts`):
   - Each event has `reminders`: up to 5 times in minutes before the start (0 to 4 weeks). Stored as a JSON array in the `reminders` column (added by `migrate` in `store.go` for older databases).
   - New events get the "Default notification" from settings.
@@ -135,6 +145,9 @@ How the app works:
   - Setting "Enable keyboard shortcuts" (Settings → Keyboard shortcuts, stored as `keyboardShortcuts`, on by default). Off: only `Esc` works, and tooltips/menus show no keys.
   - When on, tooltips show the key ("Next week (J)", "Create (C)") and the view menu shows D/W/M/Y.
   - Phones and touch devices: no key hints, no dialog, no settings section.
+- PWA (`frontend/public/`): `manifest.webmanifest`, `icon-192.png`, `icon-512.png`, `apple-touch-icon.png` and `sw.js`. The app can be installed from the browser. `sw.js` handles pages and static files network first, falls back to the cached shell when the server cannot be reached, and never caches `/api` requests. It is registered by `registerServiceWorker` in `notifications.ts` (skipped in the desktop app and outside secure contexts); it also powers the Snooze button on desktop notifications.
+- Security headers (`secureHeaders` in `backend/main.go`, applied to every response): CSP (self only, inline styles allowed), `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy`, COOP. If you add a third-party script, style, font, image host or frame, update the CSP there.
+- Accessibility: a skip link before the header, focus trapping and focus return in dialogs and sheets (`Popover.tsx` / `useFocusTrap`), `aria-label`s on icon buttons and events, `role="button"` plus Enter/Space on grid events, `aria-pressed` on toggles, `role="status"` for the snackbar and for the restore/backup messages, and `:focus-visible` rings. Keep these when changing components.
 - Environment variables: `OPENDAY_ADDR` (default `:8080`), `OPENDAY_DB` (default `openday.db`; `/data/openday.db` in Docker).
 
 ## Folder layout

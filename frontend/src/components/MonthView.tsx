@@ -15,7 +15,7 @@ const HEAD_PX = 30;
 export default function MonthView({
   cursor, events, settings, today, onSurfacePointerDown, onCreate, onEventClick, onEventContext, onDayClick,
 }: MonthViewProps) {
-  const days = T.monthGridDays(cursor);
+  const days = T.monthGridDays(cursor, settings.weekStart);
   const weeks = days.length / 7;
   const month = T.ymd(cursor)[1];
   const gridRef = useRef<HTMLDivElement>(null);
@@ -105,8 +105,13 @@ export default function MonthView({
                   const color = colorOf(ev);
                   return (
                     <button
-                      key={ev.id}
-                      className={`mv-ev ${ev.isDraft ? 'draft' : ''} ${ev.we <= today && !ev.isDraft ? 'past' : ''}`}
+                      key={`${ev.id}-${ev.occurrence ?? ev.start}`}
+                      aria-label={`${ev.title || '(No title)'}, ${ev.allDay ? 'all day' : T.formatTimeRange(ev.ws, ev.we, tf)}`}
+                      className={`mv-ev ${ev.isDraft ? 'draft' : ''} ${ev.we <= today && !ev.isDraft ? 'past' : ''} ${
+                        ev.allDay ? 'mv-allday' : ''
+                      } ${ev.allDay && ev.ws < day ? 'cont-left' : ''} ${
+                        ev.allDay && ev.we > T.addDays(day, 1) ? 'cont-right' : ''
+                      }`}
                       style={ev.isDraft ? { background: color, color: textOn(color) } : undefined}
                       onPointerDown={(e) => onChipPointerDown(e, ev)}
                       onClick={(e) => {
@@ -120,7 +125,9 @@ export default function MonthView({
                       }}
                     >
                       {!ev.isDraft && <span className="mv-dot" style={{ background: color }} />}
-                      <span className="mv-ev-time">{T.formatTime(Math.max(ev.ws, day), tf)}</span>
+                      <span className="mv-ev-time">
+                        {ev.allDay ? 'All day' : T.formatTime(Math.max(ev.ws, day), tf)}
+                      </span>
                       <span className="mv-ev-title">{ev.title || '(No title)'}</span>
                     </button>
                   );

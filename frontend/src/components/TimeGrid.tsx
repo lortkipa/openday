@@ -10,7 +10,6 @@ import type { Anchor, CalendarViewProps, ShownEvent } from '../types';
 
 const HOUR_PX = 48;
 const PX_PER_MIN = HOUR_PX / 60;
-const SNAP = 15; // minutes for drag and resize
 const CLICK_SNAP = 30; // minutes for a simple click
 const LONG_PRESS_MS = 450; // touch: hold this long to drag an event or open its menu
 const TOUCH_SLOP = 8; // touch: moving more than this (px) before the hold means "scroll"
@@ -82,6 +81,41 @@ function layoutDay(segs: Segment[]): PlacedSegment[] {
   return out;
 }
 
+// One all-day event placed in the all-day row: days [startIdx, endIdx) and a
+// lane, so overlapping events get their own line.
+interface AllDayBar {
+  ev: ShownEvent;
+  startIdx: number;
+  endIdx: number;
+  lane: number;
+}
+
+function layoutAllDay(events: ShownEvent[], days: number[]): { bars: AllDayBar[]; lanes: number } {
+  const first = days[0];
+  const n = days.length;
+  const items = events
+    .filter((ev) => ev.allDay && ev.ws < T.addDays(first, n) && ev.we > first)
+    .map((ev) => {
+      const s = Math.max(0, Math.min(n, Math.round((ev.ws - first) / T.DAY)));
+      const e = Math.max(s + 1, Math.min(n, Math.round((ev.we - first) / T.DAY)));
+      return { ev, s, e };
+    })
+    .sort((a, b) => a.s - b.s || b.e - b.s - (a.e - a.s));
+  const laneEnds: number[] = [];
+  const bars: AllDayBar[] = [];
+  for (const it of items) {
+    let lane = laneEnds.findIndex((end) => end <= it.s);
+    if (lane === -1) {
+      lane = laneEnds.length;
+      laneEnds.push(it.e);
+    } else {
+      laneEnds[lane] = it.e;
+    }
+    bars.push({ ev: it.ev, startIdx: it.s, endIdx: it.e, lane });
+  }
+  return { bars, lanes: laneEnds.length };
+}
+
 // Another time zone shown as an extra hour column.
 export interface ExtraZone {
   tz: string;
@@ -97,6 +131,7 @@ interface TimeGridProps extends CalendarViewProps {
   extraZones?: ExtraZone[];
   newEventColor: string;
   onCreate: (wallStart: number, wallEnd: number, anchor: Anchor) => void;
+  onCreateAllDay: (day: number, anchor: Anchor) => void;
   onEventTimeChange: (ev: ShownEvent, wallStart: number, wallEnd: number) => void;
   onInteract?: () => void;
 }
@@ -133,12 +168,13 @@ type Drag = CreateDrag | EventDrag;
 
 export default function TimeGrid({
   days, events, settings, today, nowWall, tzLabel, tzName, extraZones = [], newEventColor,
-  onSurfacePointerDown, onCreate, onEventClick, onEventContext, onEventTimeChange, onDayClick, onInteract,
+  onSurfacePointerDown, onCreate, onCreateAllDay, onEventClick, onEventContext, onEventTimeChange, onDayClick, onInteract,
 }: TimeGridProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const colsRef = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
   const dragRef = useRef<Drag | null>(null);
+  const snap = settings.snapMinutes || 15;
   const props = { days, onCreate, onEventClick, onEventContext, onEventTimeChange, onSurfacePointerDown, settings };
   const propsRef = useRef(props);
   propsRef.current = props;
@@ -173,16 +209,16 @@ export default function TimeGrid({
     const { dayIdx, min } = locate(e.clientX, e.clientY);
     const day = propsRef.current.days[dayIdx];
     if (d.type === 'create') {
-      return { ...d, moved, curMin: Math.floor(min / SNAP) * SNAP };
+      return { ...d, moved, curMin: Math.floor(min / snap) * snap };
     }
     if (d.type === 'move') {
       const pointer = day + min * T.MINUTE;
-      const ws = roundTo(pointer - (d.grab ?? 0), SNAP);
+      const ws = roundTo(pointer - (d.grab ?? 0), snap);
       return { ...d, moved, ws, we: ws + (d.ev.we - d.ev.ws) };
     }
     // resize: follow the pointer in the column where the drag started
     const pointer = propsRef.current.days[d.dayIdx] + min * T.MINUTE;
-    const we = Math.max(d.ev.ws + SNAP * T.MINUTE, roundTo(pointer, SNAP));
+    const we = Math.max(d.ev.ws + snap * T.MINUTE, roundTo(pointer, snap));
     return { ...d, moved, we };
   };
 
@@ -200,7 +236,7 @@ export default function TimeGrid({
         we = ws + p.settings.defaultDuration * T.MINUTE;
       } else {
         ws = day + Math.min(d.startMin, d.curMin) * T.MINUTE;
-        we = day + (Math.max(d.startMin, d.curMin) + SNAP) * T.MINUTE;
+        we = day + (Math.max(d.startMin, d.curMin) + snap) * T.MINUTE;
       }
       const r = colsRef.current!.getBoundingClientRect();
       const colW = r.width / p.days.length;
@@ -269,7 +305,7 @@ export default function TimeGrid({
       e.preventDefault();
     }
     const { dayIdx, min } = locate(e.clientX, e.clientY);
-    const startMin = Math.floor(min / SNAP) * SNAP;
+    const startMin = Math.floor(min / snap) * snap;
     begin({ type: 'create', touch, dayIdx, rawMin: min, startMin, curMin: startMin, moved: false, x: e.clientX, y: e.clientY });
   };
 
@@ -287,6 +323,7 @@ export default function TimeGrid({
 
     if (e.pointerType !== 'touch') {
       e.preventDefault();
+      (e.currentTarget as HTMLElement).focus({ preventScroll: true });
       if (!ev.isDraft) onInteract?.();
       begin(drag);
       return;
@@ -324,8 +361,10 @@ export default function TimeGrid({
   };
 
   // ---- Build the event blocks for each day ----
+  // Occurrences of a repeating event share an id, so compare the occurrence too.
+  const same = (a: ShownEvent, b: ShownEvent) => a.id === b.id && (a.occurrence ?? 0) === (b.occurrence ?? 0);
   const shown: ShownEvent[] = events.map((ev) =>
-    drag && drag.moved && drag.type !== 'create' && drag.ev.id === ev.id
+    drag && drag.moved && drag.type !== 'create' && same(drag.ev, ev)
       ? { ...ev, ws: drag.ws, we: drag.we, dragging: true }
       : ev,
   );
@@ -341,16 +380,29 @@ export default function TimeGrid({
       start: 0,
       end: 0,
       reminders: [],
+      allDay: false,
+      repeat: '',
+      repeatInterval: 1,
+      repeatWeekdays: [],
+      repeatUntil: null,
       isDraft: true,
       ws: day + Math.min(drag.startMin, drag.curMin) * T.MINUTE,
-      we: day + (Math.max(drag.startMin, drag.curMin) + SNAP) * T.MINUTE,
+      we: day + (Math.max(drag.startMin, drag.curMin) + snap) * T.MINUTE,
     });
   }
+
+  const allDay = layoutAllDay(events, days);
+  const allDayHeight = Math.max(26, 4 + allDay.lanes * 22);
+  const anchorOf = (el: Element): Anchor => {
+    const r = el.getBoundingClientRect();
+    return { left: r.left, right: r.right, top: r.top };
+  };
 
   const columns = days.map((day) => {
     const end = T.addDays(day, 1);
     const segs: Segment[] = [];
     for (const ev of shown) {
+      if (ev.allDay) continue; // all-day events are in the row above
       if (ev.ws >= end || ev.we <= day) continue;
       if (ev.ws === ev.we && ev.ws !== day) continue;
       const s = (Math.max(ev.ws, day) - day) / T.MINUTE;
@@ -365,6 +417,7 @@ export default function TimeGrid({
 
   return (
     <div className="tg">
+      <div className="tg-top">
       <div className="tg-head">
         {extraZones.map((z) => (
           <div key={z.tz} className="tg-gutter-head extra" title={z.tz.replace(/_/g, ' ')}>
@@ -382,6 +435,56 @@ export default function TimeGrid({
             </button>
           </div>
         ))}
+      </div>
+
+      {/* All-day events: one row above the hours, with bars across days. */}
+      <div className="tg-allday" style={{ height: allDayHeight }}>
+        {extraZones.map((z) => (
+          <div key={z.tz} className="tg-gutter-head extra" aria-hidden="true" />
+        ))}
+        <div className="tg-allday-gutter" aria-hidden="true" />
+        <div className="tg-allday-grid">
+          <div className="tg-allday-cells">
+            {days.map((day) => (
+              <button
+                key={day}
+                type="button"
+                className="tg-allday-cell"
+                aria-label={`Add an all-day event on ${T.weekdayName(day)}`}
+                onClick={(e) => onCreateAllDay(day, anchorOf(e.currentTarget))}
+              />
+            ))}
+          </div>
+          {allDay.bars.map((bar) => {
+            const { ev } = bar;
+            const color = colorOf(ev);
+            const label = ev.title || '(No title)';
+            return (
+              <button
+                key={`${ev.id}-${ev.occurrence ?? ev.start}-${bar.startIdx}`}
+                type="button"
+                className={`ev-ad ${ev.isDraft ? 'ev-draft' : ''}`}
+                style={{
+                  left: `${(bar.startIdx / days.length) * 100}%`,
+                  width: `calc(${((bar.endIdx - bar.startIdx) / days.length) * 100}% - 2px)`,
+                  top: 4 + bar.lane * 22,
+                  background: color,
+                  color: textOn(color),
+                }}
+                title={`${label} (all day)`}
+                aria-label={`${label}, all day`}
+                onClick={(e) => onEventClick(ev, anchorOf(e.currentTarget))}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  onEventContext(ev, e.clientX, e.clientY);
+                }}
+              >
+                <span className="ev-title">{label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
       </div>
 
       <div
@@ -422,7 +525,10 @@ export default function TimeGrid({
                     const zIndex = (ev.isDraft || ev.dragging ? 100 : 1) + seg.col;
                     return (
                       <div
-                        key={`${ev.id}-${day}`}
+                        key={`${ev.id}-${ev.occurrence ?? ev.start}-${day}`}
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`${ev.title || '(No title)'}, ${T.formatTimeRange(ev.ws, ev.we, tf)}`}
                         className={`ev ${short ? 'ev-short' : ''} ${ev.isDraft ? 'ev-draft' : ''} ${
                           ev.dragging ? 'ev-dragging' : ''
                         } ${ev.we <= nowWall && !ev.isDraft ? 'ev-past' : ''}`}
@@ -436,6 +542,13 @@ export default function TimeGrid({
                           zIndex,
                         }}
                         onPointerDown={(e) => onEventPointerDown(e, ev, dayIdx)}
+                        onKeyDown={(e) => {
+                          if (ev.isDraft) return;
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            onEventClick(ev, anchorOf(e.currentTarget));
+                          }
+                        }}
                         onContextMenu={(e) => {
                           e.preventDefault();
                           // Touch long press is handled in onEventPointerDown.

@@ -5,17 +5,26 @@ export default function YearView({
   cursor,
   today,
   onDayClick,
+  weekStart = 0,
 }: {
   cursor: number;
   today: number;
   onDayClick: (day: number) => void;
+  weekStart?: number;
 }) {
   const year = T.ymd(cursor)[0];
   return (
     <div className="yv">
       <div className="yv-grid">
         {T.MONTHS.map((name, m) => (
-          <MiniMonth key={name} month={T.makeDay(year, m, 1)} today={today} onPick={onDayClick} variant="year" />
+          <MiniMonth
+            key={name}
+            month={T.makeDay(year, m, 1)}
+            today={today}
+            onPick={onDayClick}
+            variant="year"
+            weekStart={weekStart}
+          />
         ))}
       </div>
     </div>

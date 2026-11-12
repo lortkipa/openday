@@ -89,16 +89,20 @@ Your data stays in the volume.
 
 ## ✨ Features
 
-- Day, week, month and year views.
+- Day, week, month, year and Schedule (agenda) views.
+- All-day and multi-day events, with their own row in the day and week views.
+- Repeating events: daily, weekly (pick the days), monthly or yearly, every N days/weeks/months/years, ending never or on a date. Delete one occurrence or the whole series.
 - Click the calendar to add an event. Drag to pick a time range.
 - Drag events to move them. Drag the bottom edge to resize.
 - Events have a title, description and color. Events can overlap.
-- Right-click an event to change its color or delete it.
+- Right-click an event to change its color, duplicate it or delete it.
 - Several calendars (for example "Work" and "Family"), each with its own name and color. Tick them in the sidebar to show or hide their events. Create, rename, recolor and delete calendars in Settings.
 - The event form can float or be docked to the side. On phones it slides up from the bottom.
 - Notifications: each event can have up to 5 reminders ("30 minutes before"). Set any number of minutes, hours, days or weeks (up to 4 weeks). Shown as desktop notifications (with Snooze) or as alerts in the page, with an optional sound. The calendar must be open in a browser tab, or the [desktop app](#%EF%B8%8F-desktop-app) must be running.
 - Live sync: a change in one browser tab, another computer or the desktop app shows everywhere else right away (no reload).
-- Settings: date format, time format, time zone, default event length, default notification, notification settings.
+- Backup and export: download all your data as a JSON backup (and restore it later), or export your events as an iCalendar (`.ics`) file for another calendar app. Deleting a calendar can be undone.
+- Installable on your phone or computer (PWA), with a basic offline shell.
+- Settings: date format, time format, time zone, default event length, default notification, notification settings, week start, default view, drag step and default calendar.
 - Several time zones: add up to 5 other time zones in Settings. They show as extra hour columns in the day and week views, and you can set an event's time zone to any of them.
 - Light, dark or device theme.
 - Works on phones: tap to add or open, hold an event to drag it or open its menu, swipe to change the day/week/month.

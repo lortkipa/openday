@@ -10,17 +10,23 @@ const VIEW_ITEMS: { id: View; label: string; key: string }[] = [
   { id: 'week', label: 'Week', key: 'W' },
   { id: 'month', label: 'Month', key: 'M' },
   { id: 'year', label: 'Year', key: 'Y' },
+  { id: 'agenda', label: 'Schedule', key: 'A' },
 ];
 
 // Shorter title for phones: "Nov 2026" instead of "November 2026".
 const shorten = (text: string) => text.replace(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\b/g, (m) => m.slice(0, 3));
 
-function title(view: View, cursor: number) {
+function title(view: View, cursor: number, weekStart: number) {
   const [y, m, d] = T.ymd(cursor);
   if (view === 'year') return `${y}`;
   if (view === 'day') return `${T.MONTHS[m]} ${d}, ${y}`;
+  if (view === 'agenda') {
+    const end = T.addDays(T.startOfDay(cursor), 29);
+    const [ey, em, ed] = T.ymd(end);
+    return `${T.MONTHS[m].slice(0, 3)} ${d} – ${T.MONTHS[em].slice(0, 3)} ${ed}, ${ey}`;
+  }
   if (view === 'week') {
-    const s = T.startOfWeek(cursor);
+    const s = T.startOfWeek(cursor, weekStart);
     const e = T.addDays(s, 6);
     const [sy, sm] = T.ymd(s);
     const [ey, em] = T.ymd(e);
@@ -80,15 +86,17 @@ interface HeaderProps {
   onOpenAppearance: () => void;
   onOpenShortcuts: (() => void) | null;
   shortcuts: boolean;
+  weekStart: number;
 }
 
 export default function Header({
   view, cursor, onToggleSidebar, onToday, onPrev, onNext, onView, onOpenSettings, onOpenAppearance, onOpenShortcuts,
-  shortcuts,
+  shortcuts, weekStart,
 }: HeaderProps) {
   const [viewMenu, setViewMenu] = useState<MenuAnchor | null>(null);
   const [gearMenu, setGearMenu] = useState<MenuAnchor | null>(null);
-  const unit = view;
+  // "Previous week", "Next week" (agenda shows a period, not one unit).
+  const unit = view === 'agenda' ? 'period' : view;
 
   return (
     <header className="header">
@@ -110,8 +118,8 @@ export default function Header({
           <Icon name="chevronRight" />
         </button>
         <h1 className="header-title">
-          <span className="title-long">{title(view, cursor)}</span>
-          <span className="title-short">{shorten(title(view, cursor))}</span>
+          <span className="title-long">{title(view, cursor, weekStart)}</span>
+          <span className="title-short">{shorten(title(view, cursor, weekStart))}</span>
         </h1>
       </div>
       <div className="header-right">

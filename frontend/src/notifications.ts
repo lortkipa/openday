@@ -19,6 +19,7 @@ export interface SlimEvent {
   title: string;
   start: number;
   end: number;
+  allDay: boolean;
 }
 
 // A reminder to show. `key` is unique for each event, start and reminder.
@@ -167,7 +168,13 @@ async function showDesktop(item: NotificationItem, body: string) {
 }
 
 // The minimal event data kept for a notification (it is stored and sent to the service worker).
-const slim = (e: CalendarEvent): SlimEvent => ({ id: e.id, title: e.title, start: e.start, end: e.end });
+const slim = (e: CalendarEvent): SlimEvent => ({
+  id: e.id,
+  title: e.title,
+  start: e.start,
+  end: e.end,
+  allDay: e.allDay,
+});
 
 // Keeps track of due reminders and shows them.
 // describe(event) gives the text under the title ("Friday, 11/6/2026 · 10 – 11am").
@@ -217,14 +224,23 @@ export function useNotifications({
     }
   };
 
+  // All-day events are stored as dates; their reminders fire at the start of
+  // that day in the primary time zone.
+  const instant = (at: number, allDay: boolean): number => {
+    if (!allDay) return at;
+    const tz = latest.current.settings.timeZone || T.browserTimeZone();
+    return T.fromWall(at, tz);
+  };
+
   const tick = () => {
     if (latest.current.settings.notifications === 'off') return;
     const now = Date.now();
     const due: NotificationItem[] = [];
     for (const e of upcoming.current) {
+      const end = instant(e.end, e.allDay);
       for (const m of e.reminders || []) {
-        const at = e.start - m * T.MINUTE;
-        if (at <= now && now - at < LATE_LIMIT && now < e.end) {
+        const at = instant(e.start, e.allDay) - m * T.MINUTE;
+        if (at <= now && now - at < LATE_LIMIT && now < end) {
           due.push({ key: `${e.id}:${e.start}:${m}`, event: slim(e) });
         }
       }
@@ -232,7 +248,9 @@ export function useNotifications({
     const snoozed = readStore<Snoozed[]>(SNOOZED_KEY, []);
     const waiting = snoozed.filter((s) => s.at > now);
     for (const s of snoozed) {
-      if (s.at <= now && now < s.event.end) due.push({ key: `${s.key}:snooze:${s.at}`, event: s.event });
+      if (s.at <= now && now < instant(s.event.end, s.event.allDay)) {
+        due.push({ key: `${s.key}:snooze:${s.at}`, event: s.event });
+      }
     }
     if (waiting.length !== snoozed.length) writeStore(SNOOZED_KEY, waiting);
     for (const item of due) if (claim(item.key)) show(item);
@@ -276,7 +294,8 @@ export function useNotifications({
     let cancelled = false;
     const load = () => {
       const now = Date.now();
-      api.listEvents(now - T.HOUR, now + FETCH_AHEAD).then(
+      const tz = latest.current.settings.timeZone || T.browserTimeZone();
+      api.listEvents(now - T.HOUR, now + FETCH_AHEAD, tz).then(
         (list) => {
           if (cancelled) return;
           upcoming.current = list;

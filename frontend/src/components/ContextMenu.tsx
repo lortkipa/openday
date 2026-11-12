@@ -13,6 +13,7 @@ interface ContextMenuProps {
   onColor: (color: string) => void;
   onEdit: () => void;
   onDelete: () => void;
+  onDuplicate: () => void;
 }
 
 // Right-click menu on an event: change color, edit or delete.
@@ -27,11 +28,15 @@ export default function ContextMenu({
   onColor,
   onEdit,
   onDelete,
+  onDuplicate,
 }: ContextMenuProps) {
   return (
     <FloatingMenu x={x} y={y} closing={closing} onClose={onClose} label="Event options">
       <button role="menuitem" className="menu-item" onClick={onEdit}>
         <Icon name="edit" size={20} /> Edit
+      </button>
+      <button role="menuitem" className="menu-item" onClick={onDuplicate}>
+        <Icon name="contentCopy" size={20} /> Duplicate
       </button>
       <button role="menuitem" className="menu-item" onClick={onDelete}>
         <Icon name="delete" size={20} /> Delete
